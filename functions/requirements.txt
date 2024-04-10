@@ -1,4 +1,4 @@
 firebase_functions~=0.1.0
-python-dotenv
+firebase_admin
 openai
-line-bot-sdk==3.2.0
+line-bot-sdk==3.9.0
