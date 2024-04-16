@@ -74,6 +74,25 @@ class WebhookHandler:
                 time.sleep(1)
                 active_thread_with_status = active_thread_with_status.set_status()
                 print("status" + active_thread_with_status._status)
+                
+            if active_thread_with_status.is_completed():
+                assistant_answer = active_thread_with_status.fetch_current_message()
+                with ApiClient(self._configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            replyToken=event.reply_token,
+                            notificationDisabled=None,
+                            messages=[
+                                TextMessage(
+                                    text=assistant_answer,
+                                    quickReply=None,
+                                    quoteToken=None,
+                                )
+                            ],
+                        )
+                    )
+                return https_fn.Response({"message": "thread is completed"}, status=200)
 
             if active_thread_with_status.requires_action():
                 print("requires_action")
@@ -117,7 +136,27 @@ class WebhookHandler:
                             ],
                         )
                     )
+                active_thread_with_status.delete(group)
                 return https_fn.Response({"message": "thread is completed"}, status=200)
+            
+            if active_thread_with_status.is_faild():
+                with ApiClient(self._configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            replyToken=event.reply_token,
+                            notificationDisabled=None,
+                            messages=[
+                                TextMessage(
+                                    text="すみません、技術的な問題が発生しました。",
+                                    quickReply=None,
+                                    quoteToken=None,
+                                )
+                            ],
+                        )
+                    )
+                
+                active_thread_with_status.delete(group)
 
 
             return https_fn.Response({"message": "sucess"}, status=200)
@@ -210,8 +249,10 @@ class Thread:
         thread = self._client.create()
         return Thread(id=thread.id)
 
-    def delete(self):
+    def delete(self, group: Group):
         self._client.delete(thread_id=self.id)
+        group.thread_id = ""
+        group.update()
 
     def add_message(self, message: str):
         self._client.messages.create(thread_id=self.id, role="user", content=message)
@@ -259,6 +300,9 @@ class Thread:
 
     def is_completed(self) -> bool:
         return self._status == "completed"
+    
+    def is_faild(self) -> bool:
+        return self._status == "failed"
 
 
 class Message:
