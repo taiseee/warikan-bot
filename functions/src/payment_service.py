@@ -79,8 +79,8 @@ class PaymentService:
         # 支払いを支払い者ごとに集計する
         paid = []
         for payer in payers:
-            statement_ref = self._db.collection("groups").document(group_id).collection("payers").document(payer.id).collection("statements")
-            statements = statement_ref.get()
+            statement_collection = self._db.collection("groups").document(group_id).collection("payers").document(payer.id).collection("statements")
+            statements = statement_collection.get()
             print(statements)
             paid.append(
                 {
@@ -92,14 +92,14 @@ class PaymentService:
             )
             # 集計し終わった支払い内容、支払い者を削除する
             for statement in statements:
-                self._db.collection("statements").document(statement.id).delete()
-            self._db.collection("payers").document(payer.id).delete()
+                statement_collection.document(statement.id).delete()
+            payer_collection.document(payer.id).delete()
 
         # 一度も支払っていない人を追加する
         if len(paid) < div_num:
             add = div_num - len(paid)
             for i in range(add):
-                paid.append({"name": "未登録", "amount": 0})
+                paid.append({"name": f"未登録{i}", "amount": 0})
 
         total_paid = sum([item.get("amount") for item in paid])
         average = total_paid / div_num
