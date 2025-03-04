@@ -9,7 +9,7 @@
 夏休みに時間がありgptの関数呼び出し機能を使ってみたかったので作成しました。
 バックエンドはFirebaseです。
 
-![割り勘bot LINE](/images/warikanbot-line.JPG)
+<img src="/images/warikanbot-line.JPG" width="50%" />
 
 # 技術
 ![skills](/images/skills.png)
