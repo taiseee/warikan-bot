@@ -9,8 +9,10 @@
 夏休みに時間がありgptの関数呼び出し機能を使ってみたかったので作成しました。
 バックエンドはFirebaseです。
 
+![割り勘bot LINE](/images/warikanbot-line.JPG)
+
 # 技術
-https://skillicons.dev/icons?i=firebase,python&theme=light
+![skills](/images/skills.png)
 
 # リンク
 [LINEアカウント](https://liff.line.me/1645278921-kWRPP32q/?accountId=671hezvm)
