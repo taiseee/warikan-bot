@@ -9,9 +9,7 @@
 夏休みに時間がありgptの関数呼び出し機能を使ってみたかったので作成しました。
 バックエンドはFirebaseです。
 
-<div style="text-align: center;">
-  <img src="/images/warikanbot-line.JPG" width="50%" />
-</div>
+<img src="/images/warikanbot-line.JPG" width="50%" />
 
 # 技術
 <img src="/images/skills.png" width="25%" />
