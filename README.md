@@ -9,10 +9,12 @@
 夏休みに時間がありgptの関数呼び出し機能を使ってみたかったので作成しました。
 バックエンドはFirebaseです。
 
-<img src="/images/warikanbot-line.JPG" width="50%" />
+<div style="text-align: center;">
+  <img src="/images/warikanbot-line.JPG" width="50%" />
+</div>
 
 # 技術
-![skills](/images/skills.png)
+<img src="/images/skills.png" width="25%" />
 
 # リンク
 [LINEアカウント](https://liff.line.me/1645278921-kWRPP32q/?accountId=671hezvm)
