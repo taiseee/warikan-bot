@@ -1,7 +1,4 @@
 from firebase_functions import https_fn
-from firebase_functions.firestore_fn import (
-    DocumentSnapshot,
-)
 from linebot.v3 import WebhookHandler as LineWebhookHandler
 from linebot.v3.messaging import (
     Configuration,
