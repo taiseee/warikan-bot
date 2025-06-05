@@ -136,7 +136,7 @@ class WebhookHandler:
                 active_thread_with_status.delete(group)
                 return https_fn.Response({"message": "thread is completed"}, status=200)
             
-            if active_thread_with_status.is_faild():
+            if active_thread_with_status.is_failed():
                 with ApiClient(self._configuration) as api_client:
                     line_bot_api = MessagingApi(api_client)
                     line_bot_api.reply_message_with_http_info(
@@ -298,7 +298,7 @@ class Thread:
     def is_completed(self) -> bool:
         return self._status == "completed"
     
-    def is_faild(self) -> bool:
+    def is_failed(self) -> bool:
         return self._status == "failed"
 
 
