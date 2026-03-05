@@ -290,7 +290,7 @@ class Thread:
         )
 
     def is_in_progress(self) -> bool:
-        return self._status == "in_progress"
+        return self._status == "in_progress" or self._status == "queued"
 
     def requires_action(self) -> bool:
         return self._status == "requires_action"
