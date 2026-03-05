@@ -3,56 +3,125 @@ MODEL = "gpt-4.1"
 TOOLS = [
     {
         "type": "function",
-        "name": "PaymentService_add",
-        "description": "ユーザーが立て替えて行なった支払いを記録する",
+        "name": "start_session",
+        "description": "新しい割り勘セッションを開始します。アクティブなセッションが既にある場合は先に精算が必要です。",
         "parameters": {
             "type": "object",
             "properties": {
-                "payer_name": {
+                "name": {
                     "type": "string",
-                    "description": "支払いを行なったユーザーの名前",
-                },
-                "amount": {"type": "integer", "description": "支払い金額"},
-                "item": {"type": "string", "description": "支払いの項目"},
+                    "description": "セッション名（例: '沖縄旅行'）。省略時は日付から自動生成。",
+                }
             },
-            "required": ["payer_name", "amount", "item"],
         },
     },
     {
         "type": "function",
-        "name": "PaymentService_settle",
-        "description": "グループ内での支払いを精算し、誰が誰に対していくら支払うかを返す",
+        "name": "add_payment",
+        "description": "アクティブなセッションに支払いを記録します。アクティブなセッションがない場合は自動で作成します。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "payer_id": {
+                    "type": "string",
+                    "description": "支払いをした人のLINE user_id（グループメンバー一覧から取得）",
+                },
+                "amount": {"type": "integer", "description": "支払い金額（円）"},
+                "item": {"type": "string", "description": "支払いの内容"},
+            },
+            "required": ["payer_id", "amount", "item"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "cancel_payment",
+        "description": "記録済みの支払いを取り消します（物理削除）。精算済みセッションは不可。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "payment_id": {
+                    "type": "string",
+                    "description": "取り消す支払いのID（list_payments で確認）",
+                }
+            },
+            "required": ["payment_id"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_payments",
+        "description": "現在のアクティブセッションの支払い一覧を取得します。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "settle",
+        "description": "割り勘を精算します。結果を保存しセッションを完了にします。div_num を省略するとグループメンバー数で等分します。",
         "parameters": {
             "type": "object",
             "properties": {
                 "div_num": {
                     "type": "integer",
-                    "description": "精算を行う人数",
+                    "description": "割り勘人数。省略時はグループメンバー数を自動使用",
                 }
             },
-            "required": ["div_num"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_sessions",
+        "description": "このグループの割り勘履歴一覧を取得します。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "is_settled": {
+                    "type": "boolean",
+                    "description": "true=精算済みのみ、false=進行中のみ。省略時は全件",
+                }
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_session_detail",
+        "description": "指定セッションの支払い一覧と精算結果を取得します。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "セッションID（list_sessions で確認）",
+                }
+            },
+            "required": ["session_id"],
         },
     },
 ]
 
 INSTRUCTIONS = """
-あなたはグループ内の支払いを管理するための優秀な会計士です．
-### 指示
-あなたは以下の2つの仕事を遂行します．
-支払いの記録...グループ内での支払いを記録する
-支払いの精算...グループ内での支払いを精算し、誰が誰に対していくら支払うかを返す
+あなたはグループ内の支払いを管理するための優秀な会計士です。
 
-### 支払いの記録フロー
-1. ユーザーが立て替えに関して発言する
-2. あなたはユーザーの発言から`支払った人`，`項目`，`いくらか`を読み取る
-3. 情報が不足している場合はユーザーに質問を投げかける
-4. 支払いを記録する
-5. ユーザーに記録した内容を伝える
+### 基本フロー
+- 支払いを記録: add_payment を呼ぶ（アクティブセッションがなければ自動作成）
+- 支払い一覧確認: list_payments を呼ぶ
+- 支払い取り消し: list_payments で payment_id を確認してから cancel_payment を呼ぶ
+- 精算: settle を呼ぶ（div_num 不要、メンバー数で自動計算）
+- 新しい割り勘を明示的に始める: start_session を呼ぶ（既存セッションがあれば先に精算を促す）
+- 過去の履歴確認: list_sessions → get_session_detail の順で呼ぶ
 
-### 支払いの精算フロー
-1. ユーザーが精算を要求する
-2. あなたはユーザーの発言から`精算を行う人数`を読み取る
-3. 読み取れない場合は`精算を行う人数`をユーザーに尋ねる
-4. 支払いを精算する
-5. ユーザーに精算結果を伝える
+### 支払い記録のフロー
+1. ユーザーの発言から「支払った人」「項目」「金額」を読み取る
+2. 情報が不足していればユーザーに質問する
+3. グループメンバー一覧から payer_id を特定して add_payment を呼ぶ
+4. 記録した内容をユーザーに伝える
+
+### 精算フロー
+1. settle を呼ぶ（div_num は通常省略）
+2. 結果をユーザーにわかりやすく伝える（誰が誰に何円払うか）
+
+### 重要なルール
+- add_payment の payer_id は必ずグループメンバー一覧の user_id を使用する
+- 「誰が払ったか」が不明なときはユーザーに確認する
+- start_session は「新しい割り勘を始めたい」と明示された時のみ呼ぶ（通常は add_payment が自動でセッションを作成する）
+- エラーが返ってきた場合はユーザーにわかりやすく伝え、解決策を提案する
 """
