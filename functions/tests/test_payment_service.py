@@ -33,6 +33,11 @@ MEMBERS = [
     {"user_id": "U3", "display_name": "Charlie"},
 ]
 
+MEMBERS_5 = MEMBERS + [
+    {"user_id": "U4", "display_name": "Dave"},
+    {"user_id": "U5", "display_name": "Eve"},
+]
+
 
 @pytest.fixture
 def svc():
@@ -266,7 +271,7 @@ class TestSettle:
     @patch.object(Session, "fetch_active")
     @patch.object(Session, "mark_settled")
     def test_settle_success(self, mock_mark, mock_fetch, mock_members, svc):
-        """複数人の支払いで精算 → 送金指示が生成される"""
+        """div_num=None（全員割り勘）→ 全メンバーで精算"""
         mock_fetch.return_value = _make_session()
         self._setup_settle(svc, [
             {"payer_id": "U1", "amount": 3000},
@@ -279,11 +284,11 @@ class TestSettle:
         assert len(result["details"]["transfers"]) > 0
         mock_mark.assert_called_once()
 
-    @patch("src.payment_service.Group.get_members", return_value=MEMBERS[:2])  # Alice, Bob
+    @patch("src.payment_service.Group.get_members", return_value=MEMBERS)
     @patch.object(Session, "fetch_active")
     @patch.object(Session, "mark_settled")
     def test_settle_with_div_num(self, mock_mark, mock_fetch, mock_members, svc):
-        """div_num を明示指定して精算"""
+        """div_num=2 < メンバー数3: 支払い者1人 + 未払いA で2人精算"""
         mock_fetch.return_value = _make_session()
         self._setup_settle(svc, [
             {"payer_id": "U1", "amount": 2000},
@@ -291,26 +296,32 @@ class TestSettle:
         result = svc.settle("G1", div_num=2)
         assert result["status"] == "success"
         assert result["details"]["per_person"] == 1000
+        # 未払いA → U1 への送金が1件
+        assert len(result["details"]["transfers"]) == 1
+        assert result["details"]["transfers"][0]["from_name"] == "未払いA"
 
     @patch("src.payment_service.Group.get_members", return_value=MEMBERS)
     @patch.object(Session, "fetch_active")
     @patch.object(Session, "mark_settled")
-    def test_settle_with_unpaid_members(self, mock_mark, mock_fetch, mock_members, svc):
-        """未払いメンバーがいる場合 → amount=0 で含まれる"""
+    def test_settle_with_unpaid_members_default(self, mock_mark, mock_fetch, mock_members, svc):
+        """div_num=None → 全メンバーが paid に含まれる（未払いメンバーは display_name で追加）"""
         mock_fetch.return_value = _make_session()
         self._setup_settle(svc, [
             {"payer_id": "U1", "amount": 3000},
         ])
         result = svc.settle("G1")
         assert result["status"] == "success"
-        # per_person = 3000 / 3 = 1000
         assert result["details"]["per_person"] == 1000
+        # Bob, Charlie が名前付きで送金元に含まれる
+        transfer_froms = {t["from_name"] for t in result["details"]["transfers"]}
+        assert "Bob" in transfer_froms
+        assert "Charlie" in transfer_froms
 
-    @patch("src.payment_service.Group.get_members", return_value=MEMBERS[:1])  # Only Alice
+    @patch("src.payment_service.Group.get_members", return_value=MEMBERS_5)
     @patch.object(Session, "fetch_active")
     @patch.object(Session, "mark_settled")
-    def test_settle_unregistered_members_fill(self, mock_mark, mock_fetch, mock_members, svc):
-        """未登録メンバー補完: div_num > メンバー数 → "未登録A" 等が生成"""
+    def test_settle_div_num_fills_anonymous(self, mock_mark, mock_fetch, mock_members, svc):
+        """div_num=3 < メンバー5人, 支払い者1人 → 未払いA, 未払いB で補完"""
         mock_fetch.return_value = _make_session()
         self._setup_settle(svc, [
             {"payer_id": "U1", "amount": 3000},
@@ -318,9 +329,9 @@ class TestSettle:
         result = svc.settle("G1", div_num=3)
         assert result["status"] == "success"
         assert result["details"]["per_person"] == 1000
-        # Check transfers include 未登録 members
         transfer_froms = [t["from_name"] for t in result["details"]["transfers"]]
-        assert any("未登録" in name for name in transfer_froms)
+        assert "未払いA" in transfer_froms
+        assert "未払いB" in transfer_froms
 
     # ── 異常系 ──
 
@@ -352,6 +363,15 @@ class TestSettle:
         result = svc.settle("G1")
         assert result["status"] == "error"
         assert "メンバーが登録されていません" in result["message"]
+
+    @patch("src.payment_service.Group.get_members", return_value=MEMBERS)
+    @patch.object(Session, "fetch_active")
+    def test_settle_div_num_exceeds_members(self, mock_fetch, mock_members, svc):
+        """div_num > メンバー数 → エラー（ユースケース外）"""
+        mock_fetch.return_value = _make_session()
+        result = svc.settle("G1", div_num=5)
+        assert result["status"] == "error"
+        assert "グループメンバー数" in result["message"]
 
     @patch("src.payment_service.Group.get_members", return_value=MEMBERS)
     @patch.object(Session, "fetch_active")
@@ -407,7 +427,6 @@ class TestSettle:
         ])
         result = svc.settle("G1")
         assert result["status"] == "success"
-        # per_person = 1/3 ≈ 0.33, rounded = 0
         assert result["details"]["per_person"] == round(1 / 3)
 
 

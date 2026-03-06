@@ -148,6 +148,12 @@ class PaymentService:
                 "message": "グループにメンバーが登録されていません。div_num を指定してください。",
             }
 
+        if div_num > len(members):
+            return {
+                "status": "error",
+                "message": f"精算人数({div_num})がグループメンバー数({len(members)})を超えています。",
+            }
+
         docs = self._payments_ref(group_id, session.session_id).get()
         if not docs:
             return {"status": "error", "message": "支払いが記録されていません。"}
@@ -159,6 +165,12 @@ class PaymentService:
             payer_id = d["payer_id"]
             payer_totals[payer_id] = payer_totals.get(payer_id, 0) + d["amount"]
 
+        if len(payer_totals) > div_num:
+            return {
+                "status": "error",
+                "message": f"精算人数({div_num})より支払い者数({len(payer_totals)})が多いです。div_num を大きく設定してください。",
+            }
+
         total_amount = sum(payer_totals.values())
         per_person = total_amount / div_num
 
@@ -168,21 +180,16 @@ class PaymentService:
             for pid, amt in payer_totals.items()
         ]
 
-        # 未払いメンバーを追加
-        paid_ids = set(payer_totals.keys())
-        for m in members:
-            if m["user_id"] not in paid_ids:
-                paid.append({"name": m["display_name"], "amount": 0})
-
-        # div_num より少なければ「未登録X」で補完
-        for i in range(div_num - len(paid)):
-            paid.append({"name": f"未登録{chr(ord('A') + i)}", "amount": 0})
-
-        if len(paid) > div_num:
-            return {
-                "status": "error",
-                "message": f"精算人数({div_num})より支払い者数({len(paid)})が多いです。div_num を大きく設定してください。",
-            }
+        if div_num == len(members):
+            # div_num 未指定（全員割り勘）: 未払いメンバーを全員追加
+            paid_ids = set(payer_totals.keys())
+            for m in members:
+                if m["user_id"] not in paid_ids:
+                    paid.append({"name": m["display_name"], "amount": 0})
+        else:
+            # div_num 指定あり: 残り枠を「未払いX」で補完
+            for i in range(div_num - len(paid)):
+                paid.append({"name": f"未払い{chr(ord('A') + i)}", "amount": 0})
 
         payment_balance = [
             {"name": p["name"], "amount": p["amount"] - per_person}

@@ -4,11 +4,7 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 
-
-def _import_conversation():
-    """Import Conversation after conftest stubs are loaded."""
-    from src.warikanbot import Conversation
-    return Conversation
+from src.warikanbot import Conversation
 
 
 class TestConversationCreate:
@@ -16,7 +12,6 @@ class TestConversationCreate:
 
     def test_create_returns_conversation_id(self):
         """新しい会話を作成 → conversation_id が返る"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
         conv._client.conversations.create.return_value = MagicMock(id="conv_123")
@@ -26,7 +21,6 @@ class TestConversationCreate:
 
     def test_send_message_uses_conversation_id(self):
         """既存の会話にメッセージ送信 → conversation_id を使って継続"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -36,7 +30,6 @@ class TestConversationCreate:
 
     def test_send_message_includes_extra_instructions(self):
         """メッセージ送信時にメンバー情報がインストラクションに含まれる"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -59,7 +52,6 @@ class TestHandleToolCalls:
 
     def test_no_tool_calls(self):
         """ツール呼び出しなし → (response, False)"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -73,7 +65,6 @@ class TestHandleToolCalls:
     @patch("src.warikanbot.Tool")
     def test_tool_call_executed(self, MockTool):
         """ツール呼び出し1件 → Tool.exec が呼ばれる"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -89,7 +80,6 @@ class TestHandleToolCalls:
     @patch("src.warikanbot.Tool")
     def test_settle_success_returns_settled_true(self, MockTool):
         """settle 成功 → settled=True"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -105,7 +95,6 @@ class TestHandleToolCalls:
     @patch("src.warikanbot.Tool")
     def test_multiple_tool_calls(self, MockTool):
         """複数のツール呼び出し → 全て実行される"""
-        Conversation = _import_conversation()
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -125,7 +114,6 @@ class TestGetTextResponse:
 
     def test_extract_text(self):
         """テキスト応答の抽出"""
-        Conversation = _import_conversation()
         conv = Conversation()
 
         content = MagicMock()
@@ -144,7 +132,6 @@ class TestGetTextResponse:
 
     def test_no_text_response_fallback(self):
         """テキスト応答なし → フォールバックメッセージ"""
-        Conversation = _import_conversation()
         conv = Conversation()
 
         response = MagicMock()
