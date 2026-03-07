@@ -9,6 +9,11 @@ from linebot.v3.messaging import (
     QuickReply,
     QuickReplyItem,
     MessageAction,
+    FlexMessage,
+    FlexBubble,
+    FlexBox,
+    FlexText,
+    FlexSeparator,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 from linebot.v3.exceptions import InvalidSignatureError
@@ -44,6 +49,7 @@ def _build_quick_reply_items(
     members: list,
     sender_id: str,
     user_message: str = "",
+    need_payer: bool = False,
 ) -> list:
     """tools_calledの状態に応じてQuick Replyアイテムリストを返す。"""
 
@@ -79,8 +85,8 @@ def _build_quick_reply_items(
                 for k in range(n, max(1, n - 3), -1)
             ]
 
-    # UC1: ツール呼び出しなし（AIが確認中）→ メンバーボタン（送信者を先頭に）
-    if not tools_called and members:
+    # UC1: AIが支払者を確認中（[NEED_PAYER]タグ検出時のみ）→ メンバーボタン（送信者を先頭に）
+    if need_payer and members:
         members_sorted = sorted(members, key=lambda m: m["user_id"] != sender_id)
         return [
             QuickReplyItem(action=MessageAction(
@@ -91,6 +97,83 @@ def _build_quick_reply_items(
         ]
 
     return []
+
+
+def _build_settle_flex(settle_output: dict):
+    """精算結果を Flex Message カードとして生成する。"""
+    details = settle_output.get("details", {})
+    transfers = details.get("transfers", [])
+    total = details.get("total_amount", 0)
+    per_person = details.get("per_person", 0)
+
+    summary_rows = [
+        FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text="合計", size="sm", color="#555555", flex=2),
+            FlexText(text=f"¥{total:,}", size="sm", align="end", flex=1),
+        ]),
+        FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text="1人あたり", size="sm", color="#555555", flex=2),
+            FlexText(text=f"¥{per_person:,}", size="sm", align="end", flex=1),
+        ]),
+    ]
+
+    transfer_rows = [
+        FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text=t["from_name"], size="sm", flex=3),
+            FlexText(text="→", size="sm", align="center", flex=1),
+            FlexText(text=t["to_name"], size="sm", flex=3),
+            FlexText(text=f"¥{t['amount']:,}", size="sm", weight="bold", align="end", flex=3),
+        ])
+        for t in transfers
+    ]
+
+    contents = [
+        FlexText(text="🧾 精算結果", weight="bold", size="lg"),
+        FlexSeparator(margin="md"),
+        *summary_rows,
+    ]
+    if transfer_rows:
+        contents += [FlexSeparator(margin="md"), *transfer_rows]
+
+    body = FlexBox(layout="vertical", spacing="sm", paddingAll="16px", contents=contents)
+    return FlexMessage(alt_text="精算結果", contents=FlexBubble(body=body))
+
+
+def _build_list_payments_flex(list_output: dict):
+    """支払い一覧を Flex Message カードとして生成する。"""
+    payments = list_output.get("payments", [])
+    total = list_output.get("total_amount", 0)
+    session_name = list_output.get("session_name", "")
+
+    if not payments:
+        return None
+
+    payment_rows = [
+        FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text=p["payer_name"], size="sm", flex=3),
+            FlexText(text=p["item"], size="sm", color="#555555", flex=4),
+            FlexText(text=f"¥{p['amount']:,}", size="sm", align="end", flex=3),
+        ])
+        for p in payments
+    ]
+
+    body = FlexBox(
+        layout="vertical",
+        spacing="sm",
+        paddingAll="16px",
+        contents=[
+            FlexText(text="📋 支払い一覧", weight="bold", size="lg"),
+            FlexText(text=session_name, size="xs", color="#888888"),
+            FlexSeparator(margin="md"),
+            *payment_rows,
+            FlexSeparator(margin="md"),
+            FlexBox(layout="horizontal", spacing="sm", contents=[
+                FlexText(text="合計", size="sm", weight="bold", flex=7),
+                FlexText(text=f"¥{total:,}", size="sm", weight="bold", align="end", flex=3),
+            ]),
+        ],
+    )
+    return FlexMessage(alt_text="支払い一覧", contents=FlexBubble(body=body))
 
 
 class WebhookHandler:
@@ -165,17 +248,34 @@ class WebhookHandler:
                     group.update()
 
                 sender_id = event.source.user_id
+                assistant_answer = conversation.get_text_response(response)
+
+                # [NEED_PAYER] センチネルタグを検出・除去
+                need_payer = "[NEED_PAYER]" in assistant_answer
+                assistant_answer = assistant_answer.replace("[NEED_PAYER]", "").strip()
+
                 quick_items = _build_quick_reply_items(
                     tools_called=tools_called,
                     tool_outputs=tool_outputs,
                     members=members,
                     sender_id=sender_id,
                     user_message=event.message.text,
+                    need_payer=need_payer,
                 )
                 quick_reply = QuickReply(items=quick_items) if quick_items else None
 
-                assistant_answer = conversation.get_text_response(response)
-                self._reply(event, assistant_answer, quick_reply=quick_reply)
+                # Flex Message の生成（精算結果 or 支払い一覧）
+                prepend_messages = []
+                if "settle" in tools_called and tool_outputs.get("settle", {}).get("status") == "success":
+                    flex = _build_settle_flex(tool_outputs["settle"])
+                    if flex:
+                        prepend_messages.append(flex)
+                elif "list_payments" in tools_called and tool_outputs.get("list_payments", {}).get("status") == "success":
+                    flex = _build_list_payments_flex(tool_outputs["list_payments"])
+                    if flex:
+                        prepend_messages.append(flex)
+
+                self._reply(event, assistant_answer, quick_reply=quick_reply, prepend_messages=prepend_messages or None)
 
             except Exception as e:
                 print(f"Error: {e}")
@@ -219,16 +319,17 @@ class WebhookHandler:
             with ApiClient(self._configuration) as client:
                 _do_sync(client)
 
-    def _reply(self, event, text: str, quick_reply: QuickReply = None):
+    def _reply(self, event, text: str, quick_reply: QuickReply = None, prepend_messages: list = None):
         msg = TextMessage(text=text)
         if quick_reply:
             msg.quick_reply = quick_reply
+        messages = (prepend_messages or []) + [msg]
         with ApiClient(self._configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     replyToken=event.reply_token,
-                    messages=[msg],
+                    messages=messages,
                 )
             )
 
