@@ -51,16 +51,18 @@ class TestHandleToolCalls:
         return tc
 
     def test_no_tool_calls(self):
-        """ツール呼び出しなし → (response, False)"""
+        """ツール呼び出しなし → (response, False, [], {})"""
         conv = Conversation()
         conv._client = MagicMock()
 
         mock_response = MagicMock()
         mock_response.output = [MagicMock(type="message")]
 
-        result, settled = conv.handle_tool_calls(mock_response, "conv_1", "G1")
+        result, settled, tools_called, tool_outputs = conv.handle_tool_calls(mock_response, "conv_1", "G1")
         assert result == mock_response
         assert settled is False
+        assert tools_called == []
+        assert tool_outputs == {}
 
     @patch("src.warikanbot.Tool")
     def test_tool_call_executed(self, MockTool):
@@ -89,8 +91,9 @@ class TestHandleToolCalls:
 
         MockTool.return_value.exec.return_value = {"status": "success"}
 
-        _, settled = conv.handle_tool_calls(mock_response, "conv_1", "G1")
+        _, settled, tools_called, _ = conv.handle_tool_calls(mock_response, "conv_1", "G1")
         assert settled is True
+        assert "settle" in tools_called
 
     @patch("src.warikanbot.Tool")
     def test_multiple_tool_calls(self, MockTool):

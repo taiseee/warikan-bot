@@ -6,6 +6,9 @@ from linebot.v3.messaging import (
     MessagingApi,
     ReplyMessageRequest,
     TextMessage,
+    QuickReply,
+    QuickReplyItem,
+    MessageAction,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 from linebot.v3.exceptions import InvalidSignatureError
@@ -20,6 +23,74 @@ from .secrets import (
 from .assistant_factory import MODEL, TOOLS, INSTRUCTIONS
 from .model import Group
 from .payment_service import PaymentService
+
+GREETING_TEXT = """はじめまして！割り勘会計士の愛衣です！
+
+こんなことができます：
+・ 支払い記録 →「田中が3000円払った」
+・ 支払い一覧 →「支払い一覧を見せて」
+・ 取り消し  →「ランチをキャンセルして」
+・ 精算      →「精算して」
+・ 履歴確認  →「過去の割り勘を見せて」
+
+旅行・飲み会などでご活用ください！"""
+
+_SETTLE_KEYWORDS = ["精算", "割り勘", "清算", "settle"]
+
+
+def _build_quick_reply_items(
+    tools_called: list,
+    tool_outputs: dict,
+    members: list,
+    sender_id: str,
+    user_message: str = "",
+) -> list:
+    """tools_calledの状態に応じてQuick Replyアイテムリストを返す。"""
+
+    # UC4: settle完了後 → [支払い履歴を見る]
+    if "settle" in tools_called:
+        return [QuickReplyItem(action=MessageAction(label="支払い履歴を見る", text="今回の支払い履歴を見せて"))]
+
+    # UC5: add_payment完了後 → [精算する]
+    if "add_payment" in tools_called:
+        return [QuickReplyItem(action=MessageAction(label="精算する", text="精算して"))]
+
+    # UC2: list_paymentsは呼ばれたがcancel_paymentが呼ばれなかった → 支払いリストボタン
+    if "list_payments" in tools_called and "cancel_payment" not in tools_called:
+        payments = tool_outputs.get("list_payments", {}).get("payments", [])
+        if payments:
+            return [
+                QuickReplyItem(action=MessageAction(
+                    label=f"{p['item']} ¥{p['amount']}"[:20],
+                    text=f"{p['item']}をキャンセルして",
+                ))
+                for p in payments[:10]
+            ]
+
+    # UC3: 精算キーワードがあるがsettleが呼ばれなかった → 人数選択ボタン
+    if "settle" not in tools_called and any(kw in user_message for kw in _SETTLE_KEYWORDS):
+        n = len(members)
+        if n >= 2:
+            return [
+                QuickReplyItem(action=MessageAction(
+                    label=f"{k}人" + ("（全員）" if k == n else ""),
+                    text=f"{k}人で精算して",
+                ))
+                for k in range(n, max(1, n - 3), -1)
+            ]
+
+    # UC1: ツール呼び出しなし（AIが確認中）→ メンバーボタン（送信者を先頭に）
+    if not tools_called and members:
+        members_sorted = sorted(members, key=lambda m: m["user_id"] != sender_id)
+        return [
+            QuickReplyItem(action=MessageAction(
+                label=m["display_name"][:20],
+                text=m["display_name"],
+            ))
+            for m in members_sorted[:10]
+        ]
+
+    return []
 
 
 class WebhookHandler:
@@ -52,6 +123,7 @@ class WebhookHandler:
             group_id = event.source.group_id
             Group().fetch_or_create(group_id)
             self._sync_all_members(group_id)
+            self._reply(event, GREETING_TEXT)
 
         @self._handler.add(MessageEvent, message=TextMessageContent)
         def handler_message(event: MessageEvent) -> https_fn.Response:
@@ -81,7 +153,7 @@ class WebhookHandler:
                     extra_instructions=extra,
                 )
 
-                response, settled = conversation.handle_tool_calls(
+                response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
                     response=response,
                     conversation_id=group.conversation_id,
                     group_id=group.id,
@@ -92,8 +164,18 @@ class WebhookHandler:
                     group.active_session_id = ""
                     group.update()
 
+                sender_id = event.source.user_id
+                quick_items = _build_quick_reply_items(
+                    tools_called=tools_called,
+                    tool_outputs=tool_outputs,
+                    members=members,
+                    sender_id=sender_id,
+                    user_message=event.message.text,
+                )
+                quick_reply = QuickReply(items=quick_items) if quick_items else None
+
                 assistant_answer = conversation.get_text_response(response)
-                self._reply(event, assistant_answer)
+                self._reply(event, assistant_answer, quick_reply=quick_reply)
 
             except Exception as e:
                 print(f"Error: {e}")
@@ -137,13 +219,16 @@ class WebhookHandler:
             with ApiClient(self._configuration) as client:
                 _do_sync(client)
 
-    def _reply(self, event: MessageEvent, text: str):
+    def _reply(self, event, text: str, quick_reply: QuickReply = None):
+        msg = TextMessage(text=text)
+        if quick_reply:
+            msg.quick_reply = quick_reply
         with ApiClient(self._configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     replyToken=event.reply_token,
-                    messages=[TextMessage(text=text)],
+                    messages=[msg],
                 )
             )
 
@@ -221,16 +306,18 @@ class Conversation:
         group_id: str,
         extra_instructions: str = "",
     ) -> tuple:
-        """ツール呼び出しを処理する。(response, settled: bool) を返す。"""
+        """ツール呼び出しを処理する。(response, settled, tools_called, tool_outputs) を返す。"""
         tool_calls = [
             item for item in response.output if item.type == "function_call"
         ]
 
         if not tool_calls:
             print("[DEBUG] No tool calls in response.")
-            return response, False
+            return response, False, [], {}
 
         settled = False
+        tools_called = []
+        tool_outputs = {}
         tool_results = []
         for tc in tool_calls:
             print(f"[DEBUG] Tool called: {tc.name}, args: {tc.arguments}")
@@ -241,6 +328,9 @@ class Conversation:
             )
             output = tool.exec()
             print(f"[DEBUG] Tool result: {output}")
+
+            tools_called.append(tc.name)
+            tool_outputs[tc.name] = output
 
             if tc.name == "settle" and output.get("status") == "success":
                 settled = True
@@ -260,7 +350,7 @@ class Conversation:
             tools=TOOLS,
             instructions=INSTRUCTIONS + extra_instructions,
         )
-        return response, settled
+        return response, settled, tools_called, tool_outputs
 
     def get_text_response(self, response) -> str:
         for item in response.output:
