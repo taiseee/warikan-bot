@@ -1,7 +1,7 @@
 # groups
 ## column
 id: int
-thread_id: int
+conversation_id: string
 created_at: datetime
 updated_at: datetime
 ## subcollection
