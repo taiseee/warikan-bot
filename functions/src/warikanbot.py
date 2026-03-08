@@ -8,14 +8,14 @@ from linebot.v3.messaging import (
     TextMessage,
     QuickReply,
     QuickReplyItem,
-    MessageAction,
+    PostbackAction,
     FlexMessage,
     FlexBubble,
     FlexBox,
     FlexText,
     FlexSeparator,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent, PostbackEvent
 from linebot.v3.exceptions import InvalidSignatureError
 from openai import OpenAI
 import json
@@ -53,23 +53,23 @@ def _build_quick_reply_items(
 ) -> list:
     """tools_calledの状態に応じてQuick Replyアイテムリストを返す。"""
 
+    def _qr(label: str, text: str) -> QuickReplyItem:
+        return QuickReplyItem(action=PostbackAction(label=label, data=text, display_text=text))
+
     # UC4: settle完了後 → [支払い履歴を見る]
     if "settle" in tools_called:
-        return [QuickReplyItem(action=MessageAction(label="支払い履歴を見る", text="今回の支払い履歴を見せて"))]
+        return [_qr("支払い履歴を見る", "今回の支払い履歴を見せて")]
 
     # UC5: add_payment完了後 → [精算する]
     if "add_payment" in tools_called:
-        return [QuickReplyItem(action=MessageAction(label="精算する", text="精算して"))]
+        return [_qr("精算する", "精算して")]
 
     # UC2: list_paymentsは呼ばれたがcancel_paymentが呼ばれなかった → 支払いリストボタン
     if "list_payments" in tools_called and "cancel_payment" not in tools_called:
         payments = tool_outputs.get("list_payments", {}).get("payments", [])
         if payments:
             return [
-                QuickReplyItem(action=MessageAction(
-                    label=f"{p['item']} ¥{p['amount']}"[:20],
-                    text=f"{p['item']}をキャンセルして",
-                ))
+                _qr(f"{p['item']} ¥{p['amount']}"[:20], f"{p['item']}をキャンセルして")
                 for p in payments[:10]
             ]
 
@@ -78,10 +78,7 @@ def _build_quick_reply_items(
         n = len(members)
         if n >= 2:
             return [
-                QuickReplyItem(action=MessageAction(
-                    label=f"{k}人" + ("（全員）" if k == n else ""),
-                    text=f"{k}人で精算して",
-                ))
+                _qr(f"{k}人" + ("（全員）" if k == n else ""), f"{k}人で精算して")
                 for k in range(n, max(1, n - 3), -1)
             ]
 
@@ -89,10 +86,7 @@ def _build_quick_reply_items(
     if need_payer and members:
         members_sorted = sorted(members, key=lambda m: m["user_id"] != sender_id)
         return [
-            QuickReplyItem(action=MessageAction(
-                label=m["display_name"][:20],
-                text=m["display_name"],
-            ))
+            _qr(m["display_name"][:20], m["display_name"])
             for m in members_sorted[:10]
         ]
 
@@ -237,6 +231,12 @@ class WebhookHandler:
         self._handler = LineWebhookHandler(self._CHANNEL_SECRET)
         self._add()
 
+    def _is_mentioned(self, event: MessageEvent) -> bool:
+        mention = getattr(event.message, "mention", None)
+        if not mention:
+            return False
+        return any(getattr(m, "is_self", False) for m in (mention.mentionees or []))
+
     def handle(self, body: str, signature: str) -> https_fn.Response:
         try:
             self._handler.handle(body, signature)
@@ -262,121 +262,130 @@ class WebhookHandler:
 
         @self._handler.add(MessageEvent, message=TextMessageContent)
         def handler_message(event: MessageEvent) -> https_fn.Response:
-            group_id = event.source.group_id
-            group = Group().fetch_or_create(group_id)
+            # グループチャットではメンションされた時だけ応答
+            if getattr(event.source, "type", "") == "group" and not self._is_mentioned(event):
+                return
+            self._process_group_message(event, event.message.text)
+            return https_fn.Response({"message": "success"}, status=200)
 
-            # メッセージ送信者のプロフィールを更新
-            self._sync_member(group_id, event.source.user_id)
-
-            conversation = Conversation()
-
-            try:
-                if not group.conversation_id:
-                    conv_id = conversation.create()
-                    group.conversation_id = conv_id
-                    group.update()
-
-                members = Group.get_members(group_id)
-                members_context = "\n".join(
-                    f"- {m['user_id']}: {m['display_name']}" for m in members
-                )
-                extra = f"\n\n## グループメンバー\n{members_context}" if members_context else ""
-
-                response = conversation.send_message(
-                    conversation_id=group.conversation_id,
-                    message=event.message.text,
-                    extra_instructions=extra,
-                )
-
-                response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
-                    response=response,
-                    conversation_id=group.conversation_id,
-                    group_id=group.id,
-                    extra_instructions=extra,
-                )
-
-                if settled:
-                    group.active_session_id = ""
-                    group.update()
-
-                sender_id = event.source.user_id
-                assistant_answer = conversation.get_text_response(response)
-
-                # [NEED_PAYER] センチネルタグを検出・除去
-                need_payer = "[NEED_PAYER]" in assistant_answer
-                assistant_answer = assistant_answer.replace("[NEED_PAYER]", "").strip()
-
-                quick_items = _build_quick_reply_items(
-                    tools_called=tools_called,
-                    tool_outputs=tool_outputs,
-                    members=members,
-                    sender_id=sender_id,
-                    user_message=event.message.text,
-                    need_payer=need_payer,
-                )
-                quick_reply = QuickReply(items=quick_items) if quick_items else None
-
-                # Flex Message の生成（精算結果 or 支払い一覧）
-                prepend_messages = []
-                if "settle" in tools_called and tool_outputs.get("settle", {}).get("status") == "success":
-                    flex = _build_settle_flex(tool_outputs["settle"])
-                    if flex:
-                        prepend_messages.append(flex)
-                elif "list_payments" in tools_called and tool_outputs.get("list_payments", {}).get("status") == "success":
-                    flex = _build_list_payments_flex(tool_outputs["list_payments"])
-                    if flex:
-                        prepend_messages.append(flex)
-                elif "get_session_detail" in tools_called and tool_outputs.get("get_session_detail", {}).get("status") == "success":
-                    flex = _build_get_session_detail_flex(tool_outputs["get_session_detail"])
-                    if flex:
-                        prepend_messages.append(flex)
-
-                self._reply(event, assistant_answer, quick_reply=quick_reply, prepend_messages=prepend_messages or None)
-
-            except Exception as e:
-                print(f"Error: {e}")
-                # 会話が壊れた状態の場合はリセットして再試行
-                if "No tool output found" in str(e) and group.conversation_id:
-                    print("[DEBUG] Resetting broken conversation and retrying.")
-                    try:
-                        conv_id = conversation.create()
-                        group.conversation_id = conv_id
-                        group.update()
-                        response = conversation.send_message(
-                            conversation_id=group.conversation_id,
-                            message=event.message.text,
-                            extra_instructions=extra,
-                        )
-                        response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
-                            response=response,
-                            conversation_id=group.conversation_id,
-                            group_id=group.id,
-                            extra_instructions=extra,
-                        )
-                        if settled:
-                            group.active_session_id = ""
-                            group.update()
-                        sender_id = event.source.user_id
-                        quick_items = _build_quick_reply_items(
-                            tools_called=tools_called,
-                            tool_outputs=tool_outputs,
-                            members=members,
-                            sender_id=sender_id,
-                            user_message=event.message.text,
-                        )
-                        quick_reply = QuickReply(items=quick_items) if quick_items else None
-                        assistant_answer = conversation.get_text_response(response)
-                        self._reply(event, assistant_answer, quick_reply=quick_reply)
-                        return https_fn.Response({"message": "success"}, status=200)
-                    except Exception as retry_e:
-                        print(f"Error on retry: {retry_e}")
-                self._reply(event, "すみません、技術的な問題が発生しました。")
-
+        @self._handler.add(PostbackEvent)
+        def handler_postback(event: PostbackEvent) -> https_fn.Response:
+            # PostbackEvent はQuick Replyボタン操作 → メンションチェック不要
+            self._process_group_message(event, event.postback.data)
             return https_fn.Response({"message": "success"}, status=200)
 
         @self._handler.default()
         def default(event):
             return https_fn.Response({"message": "success"}, status=200)
+
+    def _process_group_message(self, event, message_text: str):
+        """グループメッセージ・ポストバックの共通処理。"""
+        group_id = event.source.group_id
+        group = Group().fetch_or_create(group_id)
+
+        self._sync_member(group_id, event.source.user_id)
+
+        conversation = Conversation()
+        extra = ""
+
+        try:
+            if not group.conversation_id:
+                conv_id = conversation.create()
+                group.conversation_id = conv_id
+                group.update()
+
+            members = Group.get_members(group_id)
+            members_context = "\n".join(
+                f"- {m['user_id']}: {m['display_name']}" for m in members
+            )
+            extra = f"\n\n## グループメンバー\n{members_context}" if members_context else ""
+
+            response = conversation.send_message(
+                conversation_id=group.conversation_id,
+                message=message_text,
+                extra_instructions=extra,
+            )
+
+            response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
+                response=response,
+                conversation_id=group.conversation_id,
+                group_id=group.id,
+                extra_instructions=extra,
+            )
+
+            if settled:
+                group.active_session_id = ""
+                group.update()
+
+            sender_id = event.source.user_id
+            assistant_answer = conversation.get_text_response(response)
+
+            need_payer = "[NEED_PAYER]" in assistant_answer
+            assistant_answer = assistant_answer.replace("[NEED_PAYER]", "").strip()
+
+            quick_items = _build_quick_reply_items(
+                tools_called=tools_called,
+                tool_outputs=tool_outputs,
+                members=members,
+                sender_id=sender_id,
+                user_message=message_text,
+                need_payer=need_payer,
+            )
+            quick_reply = QuickReply(items=quick_items) if quick_items else None
+
+            prepend_messages = []
+            if "settle" in tools_called and tool_outputs.get("settle", {}).get("status") == "success":
+                flex = _build_settle_flex(tool_outputs["settle"])
+                if flex:
+                    prepend_messages.append(flex)
+            elif "list_payments" in tools_called and tool_outputs.get("list_payments", {}).get("status") == "success":
+                flex = _build_list_payments_flex(tool_outputs["list_payments"])
+                if flex:
+                    prepend_messages.append(flex)
+            elif "get_session_detail" in tools_called and tool_outputs.get("get_session_detail", {}).get("status") == "success":
+                flex = _build_get_session_detail_flex(tool_outputs["get_session_detail"])
+                if flex:
+                    prepend_messages.append(flex)
+
+            self._reply(event, assistant_answer, quick_reply=quick_reply, prepend_messages=prepend_messages or None)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            if "No tool output found" in str(e) and group.conversation_id:
+                print("[DEBUG] Resetting broken conversation and retrying.")
+                try:
+                    conv_id = conversation.create()
+                    group.conversation_id = conv_id
+                    group.update()
+                    response = conversation.send_message(
+                        conversation_id=group.conversation_id,
+                        message=message_text,
+                        extra_instructions=extra,
+                    )
+                    response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
+                        response=response,
+                        conversation_id=group.conversation_id,
+                        group_id=group.id,
+                        extra_instructions=extra,
+                    )
+                    if settled:
+                        group.active_session_id = ""
+                        group.update()
+                    sender_id = event.source.user_id
+                    quick_items = _build_quick_reply_items(
+                        tools_called=tools_called,
+                        tool_outputs=tool_outputs,
+                        members=members,
+                        sender_id=sender_id,
+                        user_message=message_text,
+                    )
+                    quick_reply = QuickReply(items=quick_items) if quick_items else None
+                    assistant_answer = conversation.get_text_response(response)
+                    self._reply(event, assistant_answer, quick_reply=quick_reply)
+                    return
+                except Exception as retry_e:
+                    print(f"Error on retry: {retry_e}")
+            self._reply(event, "すみません、技術的な問題が発生しました。")
 
     def _sync_all_members(self, group_id: str):
         with ApiClient(self._configuration) as api_client:
