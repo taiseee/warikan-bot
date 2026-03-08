@@ -139,6 +139,58 @@ def _build_settle_flex(settle_output: dict):
     return FlexMessage(alt_text="精算結果", contents=FlexBubble(body=body))
 
 
+def _build_get_session_detail_flex(detail_output: dict):
+    """セッション詳細を Flex Message カードとして生成する。"""
+    payments = detail_output.get("payments", [])
+    session_name = detail_output.get("name", "")
+    is_settled = detail_output.get("is_settled", False)
+    settlement_result = detail_output.get("settlement_result") or {}
+
+    if not payments:
+        return None
+
+    payment_rows = [
+        FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text=p["payer_name"], size="sm", flex=3),
+            FlexText(text=p["item"], size="sm", color="#555555", flex=4),
+            FlexText(text=f"¥{p['amount']:,}", size="sm", align="end", flex=3),
+        ])
+        for p in payments
+    ]
+
+    total = sum(p["amount"] for p in payments)
+    contents = [
+        FlexText(text="📋 支払い履歴", weight="bold", size="lg"),
+        FlexText(text=session_name, size="xs", color="#888888"),
+        FlexSeparator(margin="md"),
+        *payment_rows,
+        FlexSeparator(margin="md"),
+        FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text="合計", size="sm", weight="bold", flex=7),
+            FlexText(text=f"¥{total:,}", size="sm", weight="bold", align="end", flex=3),
+        ]),
+    ]
+
+    if is_settled and settlement_result:
+        per_person = settlement_result.get("per_person", 0)
+        transfers = settlement_result.get("transfers", [])
+        contents.append(FlexSeparator(margin="md"))
+        contents.append(FlexBox(layout="horizontal", spacing="sm", contents=[
+            FlexText(text="1人あたり", size="sm", color="#555555", flex=7),
+            FlexText(text=f"¥{per_person:,}", size="sm", align="end", flex=3),
+        ]))
+        for t in transfers:
+            contents.append(FlexBox(layout="horizontal", spacing="sm", contents=[
+                FlexText(text=t["from_name"], size="sm", flex=3),
+                FlexText(text="→", size="sm", align="center", flex=1),
+                FlexText(text=t["to_name"], size="sm", flex=3),
+                FlexText(text=f"¥{t['amount']:,}", size="sm", weight="bold", align="end", flex=3),
+            ]))
+
+    body = FlexBox(layout="vertical", spacing="sm", paddingAll="16px", contents=contents)
+    return FlexMessage(alt_text=f"{session_name} 支払い履歴", contents=FlexBubble(body=body))
+
+
 def _build_list_payments_flex(list_output: dict):
     """支払い一覧を Flex Message カードとして生成する。"""
     payments = list_output.get("payments", [])
@@ -274,13 +326,51 @@ class WebhookHandler:
                     flex = _build_list_payments_flex(tool_outputs["list_payments"])
                     if flex:
                         prepend_messages.append(flex)
+                elif "get_session_detail" in tools_called and tool_outputs.get("get_session_detail", {}).get("status") == "success":
+                    flex = _build_get_session_detail_flex(tool_outputs["get_session_detail"])
+                    if flex:
+                        prepend_messages.append(flex)
 
                 self._reply(event, assistant_answer, quick_reply=quick_reply, prepend_messages=prepend_messages or None)
 
             except Exception as e:
                 print(f"Error: {e}")
+                # 会話が壊れた状態の場合はリセットして再試行
+                if "No tool output found" in str(e) and group.conversation_id:
+                    print("[DEBUG] Resetting broken conversation and retrying.")
+                    try:
+                        conv_id = conversation.create()
+                        group.conversation_id = conv_id
+                        group.update()
+                        response = conversation.send_message(
+                            conversation_id=group.conversation_id,
+                            message=event.message.text,
+                            extra_instructions=extra,
+                        )
+                        response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
+                            response=response,
+                            conversation_id=group.conversation_id,
+                            group_id=group.id,
+                            extra_instructions=extra,
+                        )
+                        if settled:
+                            group.active_session_id = ""
+                            group.update()
+                        sender_id = event.source.user_id
+                        quick_items = _build_quick_reply_items(
+                            tools_called=tools_called,
+                            tool_outputs=tool_outputs,
+                            members=members,
+                            sender_id=sender_id,
+                            user_message=event.message.text,
+                        )
+                        quick_reply = QuickReply(items=quick_items) if quick_items else None
+                        assistant_answer = conversation.get_text_response(response)
+                        self._reply(event, assistant_answer, quick_reply=quick_reply)
+                        return https_fn.Response({"message": "success"}, status=200)
+                    except Exception as retry_e:
+                        print(f"Error on retry: {retry_e}")
                 self._reply(event, "すみません、技術的な問題が発生しました。")
-                # conversation_id はリセットしない（文脈を保持）
 
             return https_fn.Response({"message": "success"}, status=200)
 
@@ -320,10 +410,16 @@ class WebhookHandler:
                 _do_sync(client)
 
     def _reply(self, event, text: str, quick_reply: QuickReply = None, prepend_messages: list = None):
-        msg = TextMessage(text=text)
-        if quick_reply:
-            msg.quick_reply = quick_reply
-        messages = (prepend_messages or []) + [msg]
+        if prepend_messages:
+            # Flex あり → TextMessage を省略し Quick Reply を Flex に付ける
+            if quick_reply:
+                prepend_messages[-1].quick_reply = quick_reply
+            messages = prepend_messages
+        else:
+            msg = TextMessage(text=text)
+            if quick_reply:
+                msg.quick_reply = quick_reply
+            messages = [msg]
         with ApiClient(self._configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message_with_http_info(
@@ -408,49 +504,52 @@ class Conversation:
         extra_instructions: str = "",
     ) -> tuple:
         """ツール呼び出しを処理する。(response, settled, tools_called, tool_outputs) を返す。"""
-        tool_calls = [
-            item for item in response.output if item.type == "function_call"
-        ]
-
-        if not tool_calls:
-            print("[DEBUG] No tool calls in response.")
-            return response, False, [], {}
-
         settled = False
         tools_called = []
         tool_outputs = {}
-        tool_results = []
-        for tc in tool_calls:
-            print(f"[DEBUG] Tool called: {tc.name}, args: {tc.arguments}")
-            tool = Tool(
-                name=tc.name,
-                args=json.loads(tc.arguments),
-                group_id=group_id,
+
+        for _ in range(10):  # 無限ループ防止
+            tool_calls = [
+                item for item in response.output if item.type == "function_call"
+            ]
+
+            if not tool_calls:
+                print("[DEBUG] No tool calls in response.")
+                break
+
+            tool_results = []
+            for tc in tool_calls:
+                print(f"[DEBUG] Tool called: {tc.name}, args: {tc.arguments}")
+                tool = Tool(
+                    name=tc.name,
+                    args=json.loads(tc.arguments),
+                    group_id=group_id,
+                )
+                output = tool.exec()
+                print(f"[DEBUG] Tool result: {output}")
+
+                tools_called.append(tc.name)
+                tool_outputs[tc.name] = output
+
+                if tc.name == "settle" and output.get("status") == "success":
+                    settled = True
+
+                tool_results.append({
+                    "type": "function_call_output",
+                    "call_id": tc.call_id,
+                    "output": json.dumps(output, ensure_ascii=False),
+                })
+
+            print(f"[DEBUG] Sending {len(tool_results)} tool result(s) back to model.")
+
+            response = self._client.responses.create(
+                model=MODEL,
+                conversation=conversation_id,
+                input=tool_results,
+                tools=TOOLS,
+                instructions=INSTRUCTIONS + extra_instructions,
             )
-            output = tool.exec()
-            print(f"[DEBUG] Tool result: {output}")
 
-            tools_called.append(tc.name)
-            tool_outputs[tc.name] = output
-
-            if tc.name == "settle" and output.get("status") == "success":
-                settled = True
-
-            tool_results.append({
-                "type": "function_call_output",
-                "call_id": tc.call_id,
-                "output": json.dumps(output, ensure_ascii=False),
-            })
-
-        print(f"[DEBUG] Sending {len(tool_results)} tool result(s) back to model.")
-
-        response = self._client.responses.create(
-            model=MODEL,
-            conversation=conversation_id,
-            input=tool_results,
-            tools=TOOLS,
-            instructions=INSTRUCTIONS + extra_instructions,
-        )
         return response, settled, tools_called, tool_outputs
 
     def get_text_response(self, response) -> str:
