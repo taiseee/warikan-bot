@@ -1,4 +1,4 @@
-firebase_functions~=0.1.0
+firebase_functions~=0.5.0
 firebase_admin
-openai
-line-bot-sdk==3.9.0
+openai>=1.75.0
+line-bot-sdk~=3.22.0
