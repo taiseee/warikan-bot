@@ -2,9 +2,9 @@
 
 import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
-from src.warikanbot import Conversation
+from src.conversation import Conversation
 
 
 class TestConversationCreate:
@@ -58,15 +58,18 @@ class TestHandleToolCalls:
         mock_response = MagicMock()
         mock_response.output = [MagicMock(type="message")]
 
-        result, settled, tools_called, tool_outputs = conv.handle_tool_calls(mock_response, "conv_1", "G1")
+        mock_executor = MagicMock()
+        result, settled, tools_called, tool_outputs = conv.handle_tool_calls(
+            mock_response, "conv_1", tool_executor=mock_executor
+        )
         assert result == mock_response
         assert settled is False
         assert tools_called == []
         assert tool_outputs == {}
+        mock_executor.assert_not_called()
 
-    @patch("src.warikanbot.Tool")
-    def test_tool_call_executed(self, MockTool):
-        """ツール呼び出し1件 → Tool.exec が呼ばれる"""
+    def test_tool_call_executed(self):
+        """ツール呼び出し1件 → tool_executor が呼ばれる"""
         conv = Conversation()
         conv._client = MagicMock()
 
@@ -74,13 +77,17 @@ class TestHandleToolCalls:
         mock_response = MagicMock()
         mock_response.output = [tc]
 
-        MockTool.return_value.exec.return_value = {"status": "success"}
+        mock_executor = MagicMock(return_value={"status": "success"})
 
-        conv.handle_tool_calls(mock_response, "conv_1", "G1")
-        MockTool.return_value.exec.assert_called_once()
+        # 2回目のレスポンスにはツール呼び出しなし（ループ終了）
+        final_response = MagicMock()
+        final_response.output = [MagicMock(type="message")]
+        conv._client.responses.create.return_value = final_response
 
-    @patch("src.warikanbot.Tool")
-    def test_settle_success_returns_settled_true(self, MockTool):
+        conv.handle_tool_calls(mock_response, "conv_1", tool_executor=mock_executor)
+        mock_executor.assert_called_once_with("add_payment", {"payer_id": "U1", "amount": 1000, "item": "test"})
+
+    def test_settle_success_returns_settled_true(self):
         """settle 成功 → settled=True"""
         conv = Conversation()
         conv._client = MagicMock()
@@ -89,14 +96,19 @@ class TestHandleToolCalls:
         mock_response = MagicMock()
         mock_response.output = [tc]
 
-        MockTool.return_value.exec.return_value = {"status": "success"}
+        mock_executor = MagicMock(return_value={"status": "success"})
 
-        _, settled, tools_called, _ = conv.handle_tool_calls(mock_response, "conv_1", "G1")
+        final_response = MagicMock()
+        final_response.output = [MagicMock(type="message")]
+        conv._client.responses.create.return_value = final_response
+
+        _, settled, tools_called, _ = conv.handle_tool_calls(
+            mock_response, "conv_1", tool_executor=mock_executor
+        )
         assert settled is True
         assert "settle" in tools_called
 
-    @patch("src.warikanbot.Tool")
-    def test_multiple_tool_calls(self, MockTool):
+    def test_multiple_tool_calls(self):
         """複数のツール呼び出し → 全て実行される"""
         conv = Conversation()
         conv._client = MagicMock()
@@ -106,10 +118,14 @@ class TestHandleToolCalls:
         mock_response = MagicMock()
         mock_response.output = [tc1, tc2]
 
-        MockTool.return_value.exec.return_value = {"status": "success"}
+        mock_executor = MagicMock(return_value={"status": "success"})
 
-        conv.handle_tool_calls(mock_response, "conv_1", "G1")
-        assert MockTool.return_value.exec.call_count == 2
+        final_response = MagicMock()
+        final_response.output = [MagicMock(type="message")]
+        conv._client.responses.create.return_value = final_response
+
+        conv.handle_tool_calls(mock_response, "conv_1", tool_executor=mock_executor)
+        assert mock_executor.call_count == 2
 
 
 class TestGetTextResponse:

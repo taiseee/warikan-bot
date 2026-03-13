@@ -7,27 +7,21 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
     QuickReply,
-    QuickReplyItem,
-    PostbackAction,
-    FlexMessage,
-    FlexBubble,
-    FlexBox,
-    FlexText,
-    FlexSeparator,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent, PostbackEvent
 from linebot.v3.exceptions import InvalidSignatureError
-from openai import OpenAI
-import json
-from .secrets import (
-    OPENAI_API_KEY,
-    OPENAI_ORGANIZATION,
-    CHANNEL_SECRET,
-    CHANNEL_ACCESS_TOKEN,
-)
-from .assistant_factory import MODEL, TOOLS, INSTRUCTIONS
+
+from .secrets import CHANNEL_SECRET, CHANNEL_ACCESS_TOKEN
 from .model import Group
 from .payment_service import PaymentService
+from .repository import GroupRepository, SessionRepository, PaymentRepository
+from .conversation import Conversation
+from .line_ui import (
+    build_quick_reply_items,
+    build_settle_flex,
+    build_get_session_detail_flex,
+    build_list_payments_flex,
+)
 
 GREETING_TEXT = """はじめまして！割り勘会計士の愛衣です！
 
@@ -40,187 +34,6 @@ GREETING_TEXT = """はじめまして！割り勘会計士の愛衣です！
 
 旅行・飲み会などでご活用ください！"""
 
-_SETTLE_KEYWORDS = ["精算", "割り勘", "清算", "settle"]
-
-
-def _build_quick_reply_items(
-    tools_called: list,
-    tool_outputs: dict,
-    members: list,
-    sender_id: str,
-    user_message: str = "",
-    need_payer: bool = False,
-) -> list:
-    """tools_calledの状態に応じてQuick Replyアイテムリストを返す。"""
-
-    def _qr(label: str, text: str) -> QuickReplyItem:
-        return QuickReplyItem(action=PostbackAction(label=label, data=text, display_text=text))
-
-    # UC4: settle完了後 → [支払い履歴を見る]
-    if "settle" in tools_called:
-        return [_qr("支払い履歴を見る", "今回の支払い履歴を見せて")]
-
-    # UC5: add_payment完了後 → [精算する]
-    if "add_payment" in tools_called:
-        return [_qr("精算する", "精算して")]
-
-    # UC2: list_paymentsは呼ばれたがcancel_paymentが呼ばれなかった → 支払いリストボタン
-    if "list_payments" in tools_called and "cancel_payment" not in tools_called:
-        payments = tool_outputs.get("list_payments", {}).get("payments", [])
-        if payments:
-            return [
-                _qr(f"{p['item']} ¥{p['amount']}"[:20], f"{p['item']}をキャンセルして")
-                for p in payments[:10]
-            ]
-
-    # UC3: 精算キーワードがあるがsettleが呼ばれなかった → 人数選択ボタン
-    if "settle" not in tools_called and any(kw in user_message for kw in _SETTLE_KEYWORDS):
-        n = len(members)
-        if n >= 2:
-            return [
-                _qr(f"{k}人" + ("（全員）" if k == n else ""), f"{k}人で精算して")
-                for k in range(n, max(1, n - 3), -1)
-            ]
-
-    # UC1: AIが支払者を確認中（[NEED_PAYER]タグ検出時のみ）→ メンバーボタン（送信者を先頭に）
-    if need_payer and members:
-        members_sorted = sorted(members, key=lambda m: m["user_id"] != sender_id)
-        return [
-            _qr(m["display_name"][:20], m["display_name"])
-            for m in members_sorted[:10]
-        ]
-
-    return []
-
-
-def _build_settle_flex(settle_output: dict):
-    """精算結果を Flex Message カードとして生成する。"""
-    details = settle_output.get("details", {})
-    transfers = details.get("transfers", [])
-    total = details.get("total_amount", 0)
-    per_person = details.get("per_person", 0)
-
-    summary_rows = [
-        FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text="合計", size="sm", color="#555555", flex=2),
-            FlexText(text=f"¥{total:,}", size="sm", align="end", flex=1),
-        ]),
-        FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text="1人あたり", size="sm", color="#555555", flex=2),
-            FlexText(text=f"¥{per_person:,}", size="sm", align="end", flex=1),
-        ]),
-    ]
-
-    transfer_rows = [
-        FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text=t["from_name"], size="sm", flex=3),
-            FlexText(text="→", size="sm", align="center", flex=1),
-            FlexText(text=t["to_name"], size="sm", flex=3),
-            FlexText(text=f"¥{t['amount']:,}", size="sm", weight="bold", align="end", flex=3),
-        ])
-        for t in transfers
-    ]
-
-    contents = [
-        FlexText(text="🧾 精算結果", weight="bold", size="lg"),
-        FlexSeparator(margin="md"),
-        *summary_rows,
-    ]
-    if transfer_rows:
-        contents += [FlexSeparator(margin="md"), *transfer_rows]
-
-    body = FlexBox(layout="vertical", spacing="sm", paddingAll="16px", contents=contents)
-    return FlexMessage(alt_text="精算結果", contents=FlexBubble(body=body))
-
-
-def _build_get_session_detail_flex(detail_output: dict):
-    """セッション詳細を Flex Message カードとして生成する。"""
-    payments = detail_output.get("payments", [])
-    session_name = detail_output.get("name", "")
-    is_settled = detail_output.get("is_settled", False)
-    settlement_result = detail_output.get("settlement_result") or {}
-
-    if not payments:
-        return None
-
-    payment_rows = [
-        FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text=p["payer_name"], size="sm", flex=3),
-            FlexText(text=p["item"], size="sm", color="#555555", flex=4),
-            FlexText(text=f"¥{p['amount']:,}", size="sm", align="end", flex=3),
-        ])
-        for p in payments
-    ]
-
-    total = sum(p["amount"] for p in payments)
-    contents = [
-        FlexText(text="📋 支払い履歴", weight="bold", size="lg"),
-        FlexText(text=session_name, size="xs", color="#888888"),
-        FlexSeparator(margin="md"),
-        *payment_rows,
-        FlexSeparator(margin="md"),
-        FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text="合計", size="sm", weight="bold", flex=7),
-            FlexText(text=f"¥{total:,}", size="sm", weight="bold", align="end", flex=3),
-        ]),
-    ]
-
-    if is_settled and settlement_result:
-        per_person = settlement_result.get("per_person", 0)
-        transfers = settlement_result.get("transfers", [])
-        contents.append(FlexSeparator(margin="md"))
-        contents.append(FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text="1人あたり", size="sm", color="#555555", flex=7),
-            FlexText(text=f"¥{per_person:,}", size="sm", align="end", flex=3),
-        ]))
-        for t in transfers:
-            contents.append(FlexBox(layout="horizontal", spacing="sm", contents=[
-                FlexText(text=t["from_name"], size="sm", flex=3),
-                FlexText(text="→", size="sm", align="center", flex=1),
-                FlexText(text=t["to_name"], size="sm", flex=3),
-                FlexText(text=f"¥{t['amount']:,}", size="sm", weight="bold", align="end", flex=3),
-            ]))
-
-    body = FlexBox(layout="vertical", spacing="sm", paddingAll="16px", contents=contents)
-    return FlexMessage(alt_text=f"{session_name} 支払い履歴", contents=FlexBubble(body=body))
-
-
-def _build_list_payments_flex(list_output: dict):
-    """支払い一覧を Flex Message カードとして生成する。"""
-    payments = list_output.get("payments", [])
-    total = list_output.get("total_amount", 0)
-    session_name = list_output.get("session_name", "")
-
-    if not payments:
-        return None
-
-    payment_rows = [
-        FlexBox(layout="horizontal", spacing="sm", contents=[
-            FlexText(text=p["payer_name"], size="sm", flex=3),
-            FlexText(text=p["item"], size="sm", color="#555555", flex=4),
-            FlexText(text=f"¥{p['amount']:,}", size="sm", align="end", flex=3),
-        ])
-        for p in payments
-    ]
-
-    body = FlexBox(
-        layout="vertical",
-        spacing="sm",
-        paddingAll="16px",
-        contents=[
-            FlexText(text="📋 支払い一覧", weight="bold", size="lg"),
-            FlexText(text=session_name, size="xs", color="#888888"),
-            FlexSeparator(margin="md"),
-            *payment_rows,
-            FlexSeparator(margin="md"),
-            FlexBox(layout="horizontal", spacing="sm", contents=[
-                FlexText(text="合計", size="sm", weight="bold", flex=7),
-                FlexText(text=f"¥{total:,}", size="sm", weight="bold", align="end", flex=3),
-            ]),
-        ],
-    )
-    return FlexMessage(alt_text="支払い一覧", contents=FlexBubble(body=body))
-
 
 class WebhookHandler:
     _CHANNEL_SECRET: str = CHANNEL_SECRET
@@ -229,6 +42,13 @@ class WebhookHandler:
     def __init__(self):
         self._configuration = Configuration(access_token=self._CHANNEL_ACCESS_TOKEN)
         self._handler = LineWebhookHandler(self._CHANNEL_SECRET)
+
+        # --- Composition Root: 具象リポジトリの生成と注入 ---
+        self._group_repo = GroupRepository()
+        session_repo = SessionRepository()
+        payment_repo = PaymentRepository()
+        self._payment_service = PaymentService(self._group_repo, session_repo, payment_repo)
+
         self._add()
 
     def _is_mentioned(self, event: MessageEvent) -> bool:
@@ -256,7 +76,10 @@ class WebhookHandler:
             if not hasattr(event.source, "group_id"):
                 return
             group_id = event.source.group_id
-            Group().fetch_or_create(group_id)
+            group = self._group_repo.find_by_id(group_id)
+            if not group:
+                group = Group(id=group_id)
+                self._group_repo.save(group)
             self._sync_all_members(group_id)
             self._reply(event, GREETING_TEXT)
 
@@ -278,23 +101,41 @@ class WebhookHandler:
         def default(event):
             return https_fn.Response({"message": "success"}, status=200)
 
+    def _make_tool_executor(self, group_id: str):
+        """Conversation に注入する tool_executor クロージャを生成する。"""
+        def _exec_tool(name: str, args: dict) -> dict:
+            return Tool(
+                name=name, args=args, group_id=group_id,
+                payment_service=self._payment_service,
+            ).exec()
+        return _exec_tool
+
     def _process_group_message(self, event, message_text: str):
         """グループメッセージ・ポストバックの共通処理。"""
         group_id = event.source.group_id
-        group = Group().fetch_or_create(group_id)
+        group = self._group_repo.find_by_id(group_id)
+        if not group:
+            group = Group(id=group_id)
+            self._group_repo.save(group)
 
         self._sync_member(group_id, event.source.user_id)
 
         conversation = Conversation()
         extra = ""
+        tool_executor = self._make_tool_executor(group_id)
 
         try:
             if not group.conversation_id:
                 conv_id = conversation.create()
                 group.conversation_id = conv_id
-                group.update()
+                self._group_repo.save(group)
 
-            members = Group.get_members(group_id)
+            # Group集約からメンバー取得（sync後に再取得）
+            group = self._group_repo.find_by_id(group_id)
+            members = [
+                {"user_id": m.user_id, "display_name": m.display_name}
+                for m in group.members
+            ]
             members_context = "\n".join(
                 f"- {m['user_id']}: {m['display_name']}" for m in members
             )
@@ -309,13 +150,13 @@ class WebhookHandler:
             response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
                 response=response,
                 conversation_id=group.conversation_id,
-                group_id=group.id,
+                tool_executor=tool_executor,
                 extra_instructions=extra,
             )
 
             if settled:
                 group.active_session_id = ""
-                group.update()
+                self._group_repo.save(group)
 
             sender_id = event.source.user_id
             assistant_answer = conversation.get_text_response(response)
@@ -323,7 +164,7 @@ class WebhookHandler:
             need_payer = "[NEED_PAYER]" in assistant_answer
             assistant_answer = assistant_answer.replace("[NEED_PAYER]", "").strip()
 
-            quick_items = _build_quick_reply_items(
+            quick_items = build_quick_reply_items(
                 tools_called=tools_called,
                 tool_outputs=tool_outputs,
                 members=members,
@@ -335,15 +176,15 @@ class WebhookHandler:
 
             prepend_messages = []
             if "settle" in tools_called and tool_outputs.get("settle", {}).get("status") == "success":
-                flex = _build_settle_flex(tool_outputs["settle"])
+                flex = build_settle_flex(tool_outputs["settle"])
                 if flex:
                     prepend_messages.append(flex)
             elif "list_payments" in tools_called and tool_outputs.get("list_payments", {}).get("status") == "success":
-                flex = _build_list_payments_flex(tool_outputs["list_payments"])
+                flex = build_list_payments_flex(tool_outputs["list_payments"])
                 if flex:
                     prepend_messages.append(flex)
             elif "get_session_detail" in tools_called and tool_outputs.get("get_session_detail", {}).get("status") == "success":
-                flex = _build_get_session_detail_flex(tool_outputs["get_session_detail"])
+                flex = build_get_session_detail_flex(tool_outputs["get_session_detail"])
                 if flex:
                     prepend_messages.append(flex)
 
@@ -356,7 +197,7 @@ class WebhookHandler:
                 try:
                     conv_id = conversation.create()
                     group.conversation_id = conv_id
-                    group.update()
+                    self._group_repo.save(group)
                     response = conversation.send_message(
                         conversation_id=group.conversation_id,
                         message=message_text,
@@ -365,14 +206,14 @@ class WebhookHandler:
                     response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
                         response=response,
                         conversation_id=group.conversation_id,
-                        group_id=group.id,
+                        tool_executor=tool_executor,
                         extra_instructions=extra,
                     )
                     if settled:
                         group.active_session_id = ""
-                        group.update()
+                        self._group_repo.save(group)
                     sender_id = event.source.user_id
-                    quick_items = _build_quick_reply_items(
+                    quick_items = build_quick_reply_items(
                         tools_called=tools_called,
                         tool_outputs=tool_outputs,
                         members=members,
@@ -402,12 +243,14 @@ class WebhookHandler:
             line_bot_api = MessagingApi(client)
             try:
                 profile = line_bot_api.get_group_member_profile(group_id, user_id)
-                Group.upsert_member(
-                    group_id,
-                    user_id,
-                    profile.display_name,
-                    profile.picture_url or "",
-                )
+                group = self._group_repo.find_by_id(group_id)
+                if group:
+                    group.upsert_member(
+                        user_id,
+                        profile.display_name,
+                        profile.picture_url or "",
+                    )
+                    self._group_repo.save(group)
                 print(f"[DEBUG] Synced member {user_id}: {profile.display_name}")
             except Exception as e:
                 print(f"[DEBUG] Failed to sync member {user_id}: {e}")
@@ -440,13 +283,14 @@ class WebhookHandler:
 
 
 class Tool:
-    def __init__(self, name: str = "", args: dict = None, group_id: str = ""):
+    def __init__(self, name: str = "", args: dict = None, group_id: str = "", payment_service: PaymentService = None):
         self._name = name
         self._args = args or {}
         self._group_id = group_id
+        self._payment_service = payment_service
 
     def exec(self) -> dict:
-        svc = PaymentService()
+        svc = self._payment_service
         name = self._name
         args = self._args
         gid = self._group_id
@@ -479,92 +323,3 @@ class Tool:
             return svc.get_session_detail(gid, session_id=args["session_id"])
 
         return {"status": "error", "code": 500, "message": "Tool not found."}
-
-
-class Conversation:
-    _OPENAI_API_KEY: str = OPENAI_API_KEY
-    _OPENAI_ORGANIZATION: str = OPENAI_ORGANIZATION
-
-    def __init__(self):
-        self._client = OpenAI(
-            api_key=self._OPENAI_API_KEY,
-            organization=self._OPENAI_ORGANIZATION,
-        )
-
-    def create(self) -> str:
-        conv = self._client.conversations.create()
-        return conv.id
-
-    def send_message(self, conversation_id: str, message: str, extra_instructions: str = ""):
-        response = self._client.responses.create(
-            model=MODEL,
-            conversation=conversation_id,
-            input=[{"role": "user", "content": message}],
-            tools=TOOLS,
-            instructions=INSTRUCTIONS + extra_instructions,
-        )
-        return response
-
-    def handle_tool_calls(
-        self,
-        response,
-        conversation_id: str,
-        group_id: str,
-        extra_instructions: str = "",
-    ) -> tuple:
-        """ツール呼び出しを処理する。(response, settled, tools_called, tool_outputs) を返す。"""
-        settled = False
-        tools_called = []
-        tool_outputs = {}
-
-        for _ in range(10):  # 無限ループ防止
-            tool_calls = [
-                item for item in response.output if item.type == "function_call"
-            ]
-
-            if not tool_calls:
-                print("[DEBUG] No tool calls in response.")
-                break
-
-            tool_results = []
-            for tc in tool_calls:
-                print(f"[DEBUG] Tool called: {tc.name}, args: {tc.arguments}")
-                tool = Tool(
-                    name=tc.name,
-                    args=json.loads(tc.arguments),
-                    group_id=group_id,
-                )
-                output = tool.exec()
-                print(f"[DEBUG] Tool result: {output}")
-
-                tools_called.append(tc.name)
-                tool_outputs[tc.name] = output
-
-                if tc.name == "settle" and output.get("status") == "success":
-                    settled = True
-
-                tool_results.append({
-                    "type": "function_call_output",
-                    "call_id": tc.call_id,
-                    "output": json.dumps(output, ensure_ascii=False),
-                })
-
-            print(f"[DEBUG] Sending {len(tool_results)} tool result(s) back to model.")
-
-            response = self._client.responses.create(
-                model=MODEL,
-                conversation=conversation_id,
-                input=tool_results,
-                tools=TOOLS,
-                instructions=INSTRUCTIONS + extra_instructions,
-            )
-
-        return response, settled, tools_called, tool_outputs
-
-    def get_text_response(self, response) -> str:
-        for item in response.output:
-            if item.type == "message":
-                for content in item.content:
-                    if content.type == "output_text":
-                        return content.text
-        return "応答を取得できませんでした。"
