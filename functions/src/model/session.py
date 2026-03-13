@@ -1,8 +1,9 @@
 from __future__ import annotations
-from firebase_admin import firestore
 
 
 class Session:
+    """セッションエンティティ: 割り勘セッションの状態を管理する。"""
+
     def __init__(
         self,
         session_id: str = "",
@@ -19,7 +20,12 @@ class Session:
         self.settled_at = settled_at
         self.settlement_result = settlement_result
 
-    def _to_dict(self) -> dict:
+    def mark_settled(self, settlement_result: dict):
+        """ドメインメソッド: 精算確定の状態遷移。settled_at はリポジトリが永続化時に設定。"""
+        self.is_settled = True
+        self.settlement_result = settlement_result
+
+    def to_dict(self) -> dict:
         return {
             "name": self.name,
             "is_settled": self.is_settled,
@@ -29,7 +35,7 @@ class Session:
         }
 
     @classmethod
-    def _from_doc(cls, doc) -> "Session":
+    def from_doc(cls, doc) -> Session:
         d = doc.to_dict()
         return cls(
             session_id=doc.id,
@@ -39,55 +45,3 @@ class Session:
             settled_at=d.get("settled_at"),
             settlement_result=d.get("settlement_result"),
         )
-
-    @classmethod
-    def _sessions_ref(cls, group_id: str):
-        return (
-            firestore.client()
-            .collection("groups")
-            .document(group_id)
-            .collection("sessions")
-        )
-
-    @classmethod
-    def fetch_active(cls, group_id: str) -> "Session | None":
-        docs = cls._sessions_ref(group_id).where("is_settled", "==", False).get()
-        if docs:
-            return cls._from_doc(docs[0])
-        return None
-
-    @classmethod
-    def fetch_all(cls, group_id: str) -> list["Session"]:
-        docs = (
-            cls._sessions_ref(group_id)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .get()
-        )
-        return [cls._from_doc(doc) for doc in docs]
-
-    @classmethod
-    def fetch_by_id(cls, group_id: str, session_id: str) -> "Session | None":
-        doc = cls._sessions_ref(group_id).document(session_id).get()
-        if doc.exists:
-            return cls._from_doc(doc)
-        return None
-
-    def save(self, group_id: str) -> str:
-        ref = self.__class__._sessions_ref(group_id)
-        if not self.session_id:
-            self.created_at = firestore.SERVER_TIMESTAMP
-            _, doc_ref = ref.add(self._to_dict())
-            self.session_id = doc_ref.id
-        else:
-            ref.document(self.session_id).set(self._to_dict())
-        return self.session_id
-
-    def mark_settled(self, group_id: str, settlement_result: dict):
-        self.is_settled = True
-        self.settled_at = firestore.SERVER_TIMESTAMP
-        self.settlement_result = settlement_result
-        self.__class__._sessions_ref(group_id).document(self.session_id).update({
-            "is_settled": True,
-            "settled_at": firestore.SERVER_TIMESTAMP,
-            "settlement_result": settlement_result,
-        })

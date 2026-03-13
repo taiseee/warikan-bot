@@ -1,15 +1,19 @@
 """Tests for _settle_calc — pure settlement calculation algorithm."""
 
 import pytest
+from unittest.mock import MagicMock
 from src.payment_service import PaymentService
+from src.repository.interfaces import IGroupRepository, ISessionRepository, IPaymentRepository
 
 
 @pytest.fixture
 def svc():
-    """PaymentService with mocked Firestore client."""
-    from unittest.mock import patch
-    with patch("src.payment_service.firestore"):
-        return PaymentService()
+    """PaymentService with DI-injected mock repositories."""
+    return PaymentService(
+        group_repo=MagicMock(spec=IGroupRepository),
+        session_repo=MagicMock(spec=ISessionRepository),
+        payment_repo=MagicMock(spec=IPaymentRepository),
+    )
 
 
 # ── 正常系 ──────────────────────────────────────────────

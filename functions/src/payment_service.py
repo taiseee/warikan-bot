@@ -1,8 +1,9 @@
 from __future__ import annotations
-from datetime import datetime, timezone
-from firebase_admin import firestore
 
-from .model import Group, Session
+from datetime import datetime, timezone
+
+from .model import Session
+from .repository.interfaces import IGroupRepository, ISessionRepository, IPaymentRepository
 
 
 def _fmt_ts(ts) -> str | None:
@@ -15,30 +16,40 @@ def _fmt_ts(ts) -> str | None:
 
 class PaymentService:
 
-    def __init__(self):
-        self._db = firestore.client()
+    def __init__(
+        self,
+        group_repo: IGroupRepository,
+        session_repo: ISessionRepository,
+        payment_repo: IPaymentRepository,
+    ):
+        self._group_repo = group_repo
+        self._session_repo = session_repo
+        self._payment_repo = payment_repo
 
-    def _payments_ref(self, group_id: str, session_id: str):
-        return (
-            self._db.collection("groups")
-            .document(group_id)
-            .collection("sessions")
-            .document(session_id)
-            .collection("payments")
-        )
+    def _get_members_map(self, group_id: str) -> dict[str, str]:
+        group = self._group_repo.find_by_id(group_id)
+        if not group:
+            return {}
+        return {m.user_id: m.display_name for m in group.members}
+
+    def _get_members_list(self, group_id: str) -> list[dict]:
+        group = self._group_repo.find_by_id(group_id)
+        if not group:
+            return []
+        return [{"user_id": m.user_id, "display_name": m.display_name} for m in group.members]
 
     def _get_or_create_active_session(self, group_id: str) -> Session:
-        session = Session.fetch_active(group_id)
+        session = self._session_repo.fetch_active(group_id)
         if session:
             return session
         # アクティブセッションがなければ日付から自動生成
         name = datetime.now(timezone.utc).strftime("%Y年%m月%d日")
         session = Session(name=name)
-        session.save(group_id)
+        self._session_repo.save(group_id, session)
         return session
 
     def create_session(self, group_id: str, name: str = None) -> dict:
-        existing = Session.fetch_active(group_id)
+        existing = self._session_repo.fetch_active(group_id)
         if existing:
             return {
                 "status": "error",
@@ -48,7 +59,7 @@ class PaymentService:
         if not name:
             name = datetime.now(timezone.utc).strftime("%Y年%m月%d日")
         session = Session(name=name)
-        session_id = session.save(group_id)
+        session_id = self._session_repo.save(group_id, session)
         return {
             "status": "success",
             "message": f"割り勘セッション「{name}」を開始しました。",
@@ -56,8 +67,7 @@ class PaymentService:
         }
 
     def add_payment(self, group_id: str, payer_id: str, amount: int, item: str) -> dict:
-        members = Group.get_members(group_id)
-        member_map = {m["user_id"]: m["display_name"] for m in members}
+        member_map = self._get_members_map(group_id)
 
         if payer_id not in member_map:
             return {
@@ -66,18 +76,13 @@ class PaymentService:
             }
 
         session = self._get_or_create_active_session(group_id)
-        _, doc_ref = self._payments_ref(group_id, session.session_id).add({
-            "payer_id": payer_id,
-            "item": item,
-            "amount": amount,
-            "created_at": firestore.SERVER_TIMESTAMP,
-        })
+        payment_id = self._payment_repo.add(group_id, session.session_id, payer_id, amount, item)
 
         return {
             "status": "success",
             "message": "支払いを記録しました。",
             "details": {
-                "payment_id": doc_ref.id,
+                "payment_id": payment_id,
                 "session_id": session.session_id,
                 "session_name": session.name,
                 "payer_name": member_map[payer_id],
@@ -87,16 +92,14 @@ class PaymentService:
         }
 
     def cancel_payment(self, group_id: str, payment_id: str) -> dict:
-        session = Session.fetch_active(group_id)
+        session = self._session_repo.fetch_active(group_id)
         if not session:
             return {"status": "error", "message": "アクティブなセッションがありません。"}
 
-        payment_ref = self._payments_ref(group_id, session.session_id).document(payment_id)
-        doc = payment_ref.get()
-        if not doc.exists:
+        deleted = self._payment_repo.delete(group_id, session.session_id, payment_id)
+        if not deleted:
             return {"status": "error", "message": f"支払いID '{payment_id}' が見つかりません。"}
 
-        payment_ref.delete()
         return {
             "status": "success",
             "message": "支払いを取り消しました。",
@@ -104,23 +107,22 @@ class PaymentService:
         }
 
     def list_payments(self, group_id: str) -> dict:
-        session = Session.fetch_active(group_id)
+        session = self._session_repo.fetch_active(group_id)
         if not session:
             return {"status": "error", "message": "アクティブなセッションがありません。"}
 
-        members = Group.get_members(group_id)
-        member_map = {m["user_id"]: m["display_name"] for m in members}
+        member_map = self._get_members_map(group_id)
+        raw_payments = self._payment_repo.list_ordered(group_id, session.session_id)
 
-        docs = self._payments_ref(group_id, session.session_id).order_by("created_at").get()
-        payments = []
-        for doc in docs:
-            d = doc.to_dict()
-            payments.append({
-                "payment_id": doc.id,
-                "payer_name": member_map.get(d["payer_id"], d["payer_id"]),
-                "item": d["item"],
-                "amount": d["amount"],
-            })
+        payments = [
+            {
+                "payment_id": p["payment_id"],
+                "payer_name": member_map.get(p["payer_id"], p["payer_id"]),
+                "item": p["item"],
+                "amount": p["amount"],
+            }
+            for p in raw_payments
+        ]
 
         total = sum(p["amount"] for p in payments)
         return {
@@ -132,11 +134,11 @@ class PaymentService:
         }
 
     def settle(self, group_id: str, div_num: int = None) -> dict:
-        session = Session.fetch_active(group_id)
+        session = self._session_repo.fetch_active(group_id)
         if not session:
             return {"status": "error", "message": "アクティブなセッションがありません。"}
 
-        members = Group.get_members(group_id)
+        members = self._get_members_list(group_id)
         member_map = {m["user_id"]: m["display_name"] for m in members}
 
         if div_num is None:
@@ -154,16 +156,15 @@ class PaymentService:
                 "message": f"精算人数({div_num})がグループメンバー数({len(members)})を超えています。",
             }
 
-        docs = self._payments_ref(group_id, session.session_id).get()
-        if not docs:
+        raw_payments = self._payment_repo.list_all(group_id, session.session_id)
+        if not raw_payments:
             return {"status": "error", "message": "支払いが記録されていません。"}
 
         # 支払い者ごとに集計
         payer_totals: dict[str, int] = {}
-        for doc in docs:
-            d = doc.to_dict()
-            payer_id = d["payer_id"]
-            payer_totals[payer_id] = payer_totals.get(payer_id, 0) + d["amount"]
+        for p in raw_payments:
+            payer_id = p["payer_id"]
+            payer_totals[payer_id] = payer_totals.get(payer_id, 0) + p["amount"]
 
         if len(payer_totals) > div_num:
             return {
@@ -204,7 +205,8 @@ class PaymentService:
             "transfers": transfers,
         }
 
-        session.mark_settled(group_id, settlement_result)
+        session.mark_settled(settlement_result)
+        self._session_repo.save(group_id, session)
 
         return {
             "status": "success",
@@ -232,7 +234,7 @@ class PaymentService:
         return self._settle_calc(payment, transfers)
 
     def list_sessions(self, group_id: str, is_settled: bool = None) -> dict:
-        sessions = Session.fetch_all(group_id)
+        sessions = self._session_repo.fetch_all(group_id)
         if is_settled is not None:
             sessions = [s for s in sessions if s.is_settled == is_settled]
 
@@ -251,23 +253,22 @@ class PaymentService:
         }
 
     def get_session_detail(self, group_id: str, session_id: str) -> dict:
-        session = Session.fetch_by_id(group_id, session_id)
+        session = self._session_repo.fetch_by_id(group_id, session_id)
         if not session:
             return {"status": "error", "message": f"セッション '{session_id}' が見つかりません。"}
 
-        members = Group.get_members(group_id)
-        member_map = {m["user_id"]: m["display_name"] for m in members}
+        member_map = self._get_members_map(group_id)
+        raw_payments = self._payment_repo.list_ordered(group_id, session_id)
 
-        docs = self._payments_ref(group_id, session_id).order_by("created_at").get()
-        payments = []
-        for doc in docs:
-            d = doc.to_dict()
-            payments.append({
-                "payment_id": doc.id,
-                "payer_name": member_map.get(d["payer_id"], d["payer_id"]),
-                "item": d["item"],
-                "amount": d["amount"],
-            })
+        payments = [
+            {
+                "payment_id": p["payment_id"],
+                "payer_name": member_map.get(p["payer_id"], p["payer_id"]),
+                "item": p["item"],
+                "amount": p["amount"],
+            }
+            for p in raw_payments
+        ]
 
         return {
             "status": "success",
