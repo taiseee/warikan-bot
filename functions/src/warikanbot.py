@@ -6,21 +6,33 @@ from linebot.v3.messaging import (
     MessagingApi,
     ReplyMessageRequest,
     TextMessage,
+    QuickReply,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent, PostbackEvent
 from linebot.v3.exceptions import InvalidSignatureError
-from openai import OpenAI
-import time
-import json
-from .secrets import (
-    OPENAI_API_KEY,
-    OPENAI_ORGANIZATION,
-    ASSISTANT_ID,
-    CHANNEL_SECRET,
-    CHANNEL_ACCESS_TOKEN,
-)
+
+from .secrets import CHANNEL_SECRET, CHANNEL_ACCESS_TOKEN
 from .model import Group
 from .payment_service import PaymentService
+from .repository import GroupRepository, SessionRepository, PaymentRepository
+from .conversation import Conversation
+from .line_ui import (
+    build_quick_reply_items,
+    build_settle_flex,
+    build_get_session_detail_flex,
+    build_list_payments_flex,
+)
+
+GREETING_TEXT = """はじめまして！割り勘会計士の愛衣です！
+
+こんなことができます：
+・ 支払い記録 →「田中が3000円払った」
+・ 支払い一覧 →「支払い一覧を見せて」
+・ 取り消し  →「ランチをキャンセルして」
+・ 精算      →「精算して」
+・ 履歴確認  →「過去の割り勘を見せて」
+
+旅行・飲み会などでご活用ください！"""
 
 
 class WebhookHandler:
@@ -30,12 +42,25 @@ class WebhookHandler:
     def __init__(self):
         self._configuration = Configuration(access_token=self._CHANNEL_ACCESS_TOKEN)
         self._handler = LineWebhookHandler(self._CHANNEL_SECRET)
+
+        # --- Composition Root: 具象リポジトリの生成と注入 ---
+        self._group_repo = GroupRepository()
+        session_repo = SessionRepository()
+        payment_repo = PaymentRepository()
+        self._payment_service = PaymentService(self._group_repo, session_repo, payment_repo)
+
         self._add()
+
+    def _is_mentioned(self, event: MessageEvent) -> bool:
+        mention = getattr(event.message, "mention", None)
+        if not mention:
+            return False
+        return any(getattr(m, "is_self", False) for m in (mention.mentionees or []))
 
     def handle(self, body: str, signature: str) -> https_fn.Response:
         try:
             self._handler.handle(body, signature)
-            return https_fn.Response({"message": "sucess"}, status=200)
+            return https_fn.Response({"message": "success"}, status=200)
         except InvalidSignatureError as e:
             print(f"catch InvalidSignatureError: {e}")
             return https_fn.Response(
@@ -46,292 +71,255 @@ class WebhookHandler:
             )
 
     def _add(self):
+        @self._handler.add(JoinEvent)
+        def handler_join(event: JoinEvent):
+            if not hasattr(event.source, "group_id"):
+                return
+            group_id = event.source.group_id
+            group = self._group_repo.find_by_id(group_id)
+            if not group:
+                group = Group(id=group_id)
+                self._group_repo.save(group)
+            self._sync_all_members(group_id)
+            self._reply(event, GREETING_TEXT)
+
         @self._handler.add(MessageEvent, message=TextMessageContent)
         def handler_message(event: MessageEvent) -> https_fn.Response:
-            warikan_assistant = Assistant()
+            # グループチャットではメンションされた時だけ応答
+            if getattr(event.source, "type", "") == "group" and not self._is_mentioned(event):
+                return
+            self._process_group_message(event, event.message.text)
+            return https_fn.Response({"message": "success"}, status=200)
 
-            # if not warikan_assistant.is_mentioned(event):
-            #     return https_fn.Response(
-            #         {"message": "warikan bot is not mentioned"}, status=200
-            #     )
-            group = Group().fetch_or_create(event.source.group_id)
-
-            thread = Thread().open(group)
-
-            group.thread_id = thread.id
-            group.update()
-
-            thread.add_message(event.message.text)
-
-            active_thread = thread.run()
-            print("runed")
-            active_thread_with_status = active_thread.set_status()
-            print("status" + active_thread_with_status._status)
-            while active_thread_with_status.is_in_progress():
-                time.sleep(1)
-                active_thread_with_status = active_thread_with_status.set_status()
-                print("status" + active_thread_with_status._status)
-                
-            if active_thread_with_status.is_completed():
-                assistant_answer = active_thread_with_status.fetch_current_message()
-                with ApiClient(self._configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            replyToken=event.reply_token,
-                            notificationDisabled=None,
-                            messages=[
-                                TextMessage(
-                                    text=assistant_answer,
-                                    quickReply=None,
-                                    quoteToken=None,
-                                )
-                            ],
-                        )
-                    )
-                return https_fn.Response({"message": "thread is completed"}, status=200)
-
-            if active_thread_with_status.requires_action():
-                print("requires_action")
-                action = active_thread_with_status.get_action()
-                print(action)
-
-                tool_call = action.submit_tool_outputs.tool_calls[0]
-                tool = Tool(
-                    id=tool_call.id,
-                    type=tool_call.type,
-                    name=tool_call.function.name,
-                    args=json.loads(tool_call.function.arguments),
-                    group_id=group.id,
-                )
-
-                execed_tool = tool.exec()
-                
-                active_thread_with_status.submit_tool_outputs(execed_tool)
-            
-            active_thread_with_status = active_thread.set_status()
-            print("status" + active_thread_with_status._status)
-            while active_thread_with_status.is_in_progress():
-                time.sleep(1)
-                active_thread_with_status = active_thread_with_status.set_status()
-                print("status" + active_thread_with_status._status)
-            
-            if active_thread_with_status.is_completed():
-                assistant_answer = active_thread_with_status.fetch_current_message()
-                with ApiClient(self._configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            replyToken=event.reply_token,
-                            notificationDisabled=None,
-                            messages=[
-                                TextMessage(
-                                    text=assistant_answer,
-                                    quickReply=None,
-                                    quoteToken=None,
-                                )
-                            ],
-                        )
-                    )
-                active_thread_with_status.delete(group)
-                return https_fn.Response({"message": "thread is completed"}, status=200)
-            
-            if active_thread_with_status.is_failed():
-                with ApiClient(self._configuration) as api_client:
-                    line_bot_api = MessagingApi(api_client)
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            replyToken=event.reply_token,
-                            notificationDisabled=None,
-                            messages=[
-                                TextMessage(
-                                    text="すみません、技術的な問題が発生しました。",
-                                    quickReply=None,
-                                    quoteToken=None,
-                                )
-                            ],
-                        )
-                    )
-                
-                active_thread_with_status.delete(group)
-
-
-            return https_fn.Response({"message": "sucess"}, status=200)
+        @self._handler.add(PostbackEvent)
+        def handler_postback(event: PostbackEvent) -> https_fn.Response:
+            # PostbackEvent はQuick Replyボタン操作 → メンションチェック不要
+            self._process_group_message(event, event.postback.data)
+            return https_fn.Response({"message": "success"}, status=200)
 
         @self._handler.default()
         def default(event):
-            with ApiClient(self._configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        replyToken=event.reply_token,
-                        notificationDisabled=None,
-                        messages=[
-                            TextMessage(
-                                text="Hello, default", quickReply=None, quoteToken=None
-                            )
-                        ],
+            return https_fn.Response({"message": "success"}, status=200)
+
+    def _make_tool_executor(self, group_id: str):
+        """Conversation に注入する tool_executor クロージャを生成する。"""
+        def _exec_tool(name: str, args: dict) -> dict:
+            return Tool(
+                name=name, args=args, group_id=group_id,
+                payment_service=self._payment_service,
+            ).exec()
+        return _exec_tool
+
+    def _process_group_message(self, event, message_text: str):
+        """グループメッセージ・ポストバックの共通処理。"""
+        group_id = event.source.group_id
+        group = self._group_repo.find_by_id(group_id)
+        if not group:
+            group = Group(id=group_id)
+            self._group_repo.save(group)
+
+        self._sync_member(group_id, event.source.user_id)
+
+        conversation = Conversation()
+        extra = ""
+        tool_executor = self._make_tool_executor(group_id)
+
+        try:
+            if not group.conversation_id:
+                conv_id = conversation.create()
+                group.conversation_id = conv_id
+                self._group_repo.save(group)
+
+            # Group集約からメンバー取得（sync後に再取得）
+            group = self._group_repo.find_by_id(group_id)
+            members = [
+                {"user_id": m.user_id, "display_name": m.display_name}
+                for m in group.members
+            ]
+            members_context = "\n".join(
+                f"- {m['user_id']}: {m['display_name']}" for m in members
+            )
+            extra = f"\n\n## グループメンバー\n{members_context}" if members_context else ""
+
+            response = conversation.send_message(
+                conversation_id=group.conversation_id,
+                message=message_text,
+                extra_instructions=extra,
+            )
+
+            response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
+                response=response,
+                conversation_id=group.conversation_id,
+                tool_executor=tool_executor,
+                extra_instructions=extra,
+            )
+
+            if settled:
+                group.active_session_id = ""
+                self._group_repo.save(group)
+
+            sender_id = event.source.user_id
+            assistant_answer = conversation.get_text_response(response)
+
+            need_payer = "[NEED_PAYER]" in assistant_answer
+            assistant_answer = assistant_answer.replace("[NEED_PAYER]", "").strip()
+
+            quick_items = build_quick_reply_items(
+                tools_called=tools_called,
+                tool_outputs=tool_outputs,
+                members=members,
+                sender_id=sender_id,
+                user_message=message_text,
+                need_payer=need_payer,
+            )
+            quick_reply = QuickReply(items=quick_items) if quick_items else None
+
+            prepend_messages = []
+            if "settle" in tools_called and tool_outputs.get("settle", {}).get("status") == "success":
+                flex = build_settle_flex(tool_outputs["settle"])
+                if flex:
+                    prepend_messages.append(flex)
+            elif "list_payments" in tools_called and tool_outputs.get("list_payments", {}).get("status") == "success":
+                flex = build_list_payments_flex(tool_outputs["list_payments"])
+                if flex:
+                    prepend_messages.append(flex)
+            elif "get_session_detail" in tools_called and tool_outputs.get("get_session_detail", {}).get("status") == "success":
+                flex = build_get_session_detail_flex(tool_outputs["get_session_detail"])
+                if flex:
+                    prepend_messages.append(flex)
+
+            self._reply(event, assistant_answer, quick_reply=quick_reply, prepend_messages=prepend_messages or None)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            if "No tool output found" in str(e) and group.conversation_id:
+                print("[DEBUG] Resetting broken conversation and retrying.")
+                try:
+                    conv_id = conversation.create()
+                    group.conversation_id = conv_id
+                    self._group_repo.save(group)
+                    response = conversation.send_message(
+                        conversation_id=group.conversation_id,
+                        message=message_text,
+                        extra_instructions=extra,
                     )
+                    response, settled, tools_called, tool_outputs = conversation.handle_tool_calls(
+                        response=response,
+                        conversation_id=group.conversation_id,
+                        tool_executor=tool_executor,
+                        extra_instructions=extra,
+                    )
+                    if settled:
+                        group.active_session_id = ""
+                        self._group_repo.save(group)
+                    sender_id = event.source.user_id
+                    quick_items = build_quick_reply_items(
+                        tools_called=tools_called,
+                        tool_outputs=tool_outputs,
+                        members=members,
+                        sender_id=sender_id,
+                        user_message=message_text,
+                    )
+                    quick_reply = QuickReply(items=quick_items) if quick_items else None
+                    assistant_answer = conversation.get_text_response(response)
+                    self._reply(event, assistant_answer, quick_reply=quick_reply)
+                    return
+                except Exception as retry_e:
+                    print(f"Error on retry: {retry_e}")
+            self._reply(event, "すみません、技術的な問題が発生しました。")
+
+    def _sync_all_members(self, group_id: str):
+        with ApiClient(self._configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            try:
+                response = line_bot_api.get_group_member_ids(group_id)
+                for user_id in response.member_ids:
+                    self._sync_member(group_id, user_id, api_client=api_client)
+            except Exception as e:
+                print(f"[DEBUG] Failed to sync all members for group {group_id}: {e}")
+
+    def _sync_member(self, group_id: str, user_id: str, api_client=None):
+        def _do_sync(client):
+            line_bot_api = MessagingApi(client)
+            try:
+                profile = line_bot_api.get_group_member_profile(group_id, user_id)
+                group = self._group_repo.find_by_id(group_id)
+                if group:
+                    group.upsert_member(
+                        user_id,
+                        profile.display_name,
+                        profile.picture_url or "",
+                    )
+                    self._group_repo.save(group)
+                print(f"[DEBUG] Synced member {user_id}: {profile.display_name}")
+            except Exception as e:
+                print(f"[DEBUG] Failed to sync member {user_id}: {e}")
+
+        if api_client:
+            _do_sync(api_client)
+        else:
+            with ApiClient(self._configuration) as client:
+                _do_sync(client)
+
+    def _reply(self, event, text: str, quick_reply: QuickReply = None, prepend_messages: list = None):
+        if prepend_messages:
+            # Flex あり → TextMessage を省略し Quick Reply を Flex に付ける
+            if quick_reply:
+                prepend_messages[-1].quick_reply = quick_reply
+            messages = prepend_messages
+        else:
+            msg = TextMessage(text=text)
+            if quick_reply:
+                msg.quick_reply = quick_reply
+            messages = [msg]
+        with ApiClient(self._configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    replyToken=event.reply_token,
+                    messages=messages,
                 )
-            return https_fn.Response({"message": "sucess"}, status=200)
+            )
+
 
 class Tool:
-    def __init__(
-        self,
-        id: str = "",
-        type: str = "",
-        name: str = "",
-        args: dict = {},
-        group_id: str = "",
-        output: dict = {},
-    ):
-        self._id = id
-        self._type = type
+    def __init__(self, name: str = "", args: dict = None, group_id: str = "", payment_service: PaymentService = None):
         self._name = name
-        self._args = args
+        self._args = args or {}
         self._group_id = group_id
-        self._output = output
+        self._payment_service = payment_service
 
-    def exec(self) -> "Tool":
-        if self._name == "PaymentService_add":
-            return Tool(
-                id=self._id,
-                type=self._type,
-                name=self._name,
-                args=self._args,
-                group_id=self._group_id,
-                output=PaymentService().add(group_id=self._group_id, payment=self._args)
-            )
-        if self._name == "PaymentService_settle":
-            return Tool(
-                id=self._id,
-                type=self._type,
-                name=self._name,
-                args=self._args,
-                group_id=self._group_id,
-                output=PaymentService().settle(group_id=self._group_id, args=self._args)
+    def exec(self) -> dict:
+        svc = self._payment_service
+        name = self._name
+        args = self._args
+        gid = self._group_id
+
+        if name == "start_session":
+            return svc.create_session(gid, name=args.get("name"))
+
+        if name == "add_payment":
+            return svc.add_payment(
+                gid,
+                payer_id=args["payer_id"],
+                amount=args["amount"],
+                item=args["item"],
             )
 
-        return Tool(
-            id=self._id,
-            type=self._type,
-            name=self._name,
-            args=self._args,
-            group_id=self._group_id,
-            output={
-                "status": "error",
-                "code": 500,
-                "message": "Tool not found.",
-            },
-        )
+        if name == "cancel_payment":
+            return svc.cancel_payment(gid, payment_id=args["payment_id"])
 
-class Thread:
-    _OPENAI_API_KEY: str = OPENAI_API_KEY
-    _OPENAI_ORGANIZATION: str = OPENAI_ORGANIZATION
-    _ASSISTANT_ID: str = ASSISTANT_ID
+        if name == "list_payments":
+            return svc.list_payments(gid)
 
-    def __init__(self, id: str = "", run_id: str = "", status: str = ""):
-        self._client = OpenAI(
-            api_key=self._OPENAI_API_KEY, organization=self._OPENAI_ORGANIZATION
-        ).beta.threads
-        self.id = id
-        self._run_id = run_id
-        self._status = status
+        if name == "settle":
+            return svc.settle(gid, div_num=args.get("div_num"))
 
-    def open(self, group: Group) -> "Thread":
-        if not group.thread_id == "":
-            thread = self._client.retrieve(thread_id=group.thread_id)
-            return Thread(id=thread.id)
+        if name == "list_sessions":
+            is_settled = args.get("is_settled")
+            return svc.list_sessions(gid, is_settled=is_settled)
 
-        thread = self._client.create()
-        return Thread(id=thread.id)
+        if name == "get_session_detail":
+            return svc.get_session_detail(gid, session_id=args["session_id"])
 
-    def delete(self, group: Group):
-        self._client.delete(thread_id=self.id)
-        group.thread_id = ""
-        group.update()
-
-    def add_message(self, message: str):
-        self._client.messages.create(thread_id=self.id, role="user", content=message)
-
-    def run(self) -> "Thread":
-        run = self._client.runs.create(
-            thread_id=self.id,
-            assistant_id=self._ASSISTANT_ID,
-        )
-        return Thread(id=self.id, run_id=run.id)
-
-    def fetch_current_message(self) -> str:
-        messages = self._client.messages.list(thread_id=self.id, order="desc")
-        current_message = messages._get_page_items()[0].content[0].text.value
-        return current_message
-
-    def set_status(self) -> "Thread":
-        status = self._client.runs.retrieve(
-            thread_id=self.id, run_id=self._run_id
-        ).status
-
-        return Thread(id=self.id, run_id=self._run_id, status=status)
-
-    def get_action(self):
-        return self._client.runs.retrieve(
-            thread_id=self.id, run_id=self._run_id
-        ).required_action
-
-    def submit_tool_outputs(self, execed_tool: Tool):
-        print(execed_tool._output)
-        return self._client.runs.submit_tool_outputs(
-            thread_id=self.id, run_id=self._run_id, tool_outputs=[
-                {
-                    "tool_call_id": execed_tool._id,
-                    "output": json.dumps(execed_tool._output),
-                }
-            ]
-        )
-
-    def is_in_progress(self) -> bool:
-        return self._status == "in_progress"
-
-    def requires_action(self) -> bool:
-        return self._status == "requires_action"
-
-    def is_completed(self) -> bool:
-        return self._status == "completed"
-    
-    def is_failed(self) -> bool:
-        return self._status == "failed"
-
-
-class Message:
-    _OPENAI_API_KEY: str = OPENAI_API_KEY
-    _OPENAI_ORGANIZATION: str = OPENAI_ORGANIZATION
-
-    def __init__(self):
-        self._client = OpenAI(
-            api_key=self._OPENAI_API_KEY, organization=self._OPENAI_ORGANIZATION
-        )
-
-    def create(self, thread: Thread):
-        thread._client.beta.messages.create(thread_id=thread.id, content="Hello")
-
-
-class Assistant:
-    _OPENAI_API_KEY: str = OPENAI_API_KEY
-    _OPENAI_ORGANIZATION: str = OPENAI_ORGANIZATION
-    _ASSISTANT_ID: str = ASSISTANT_ID
-
-    def __init__(self):
-        self._client = OpenAI(
-            api_key=self._OPENAI_API_KEY, organization=self._OPENAI_ORGANIZATION
-        )
-
-    # @allメンションがあるか
-    def is_mentioned(self, event: MessageEvent) -> bool:
-        if event.message.mention is None:
-            return False
-
-        for mention in event.message.mention.mentionees:
-            if mention.type == "all":
-                return True
-
-        return False
+        return {"status": "error", "code": 500, "message": "Tool not found."}
