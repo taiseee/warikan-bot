@@ -8,7 +8,7 @@ from linebot.v3.messaging import (
     TextMessage,
     QuickReply,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent, PostbackEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent, PostbackEvent, MemberJoinedEvent
 from linebot.v3.exceptions import InvalidSignatureError
 
 from .secrets import CHANNEL_SECRET, CHANNEL_ACCESS_TOKEN
@@ -83,6 +83,20 @@ class WebhookHandler:
             self._sync_all_members(group_id)
             self._reply(event, GREETING_TEXT)
 
+        @self._handler.add(MemberJoinedEvent)
+        def handler_member_joined(event: MemberJoinedEvent):
+            if not hasattr(event.source, "group_id"):
+                return
+            group_id = event.source.group_id
+            group = self._group_repo.find_by_id(group_id)
+            if not group:
+                group = Group(id=group_id)
+                self._group_repo.save(group)
+            for member in getattr(event.joined, "members", []):
+                user_id = getattr(member, "user_id", None)
+                if user_id:
+                    self._sync_member(group_id, user_id)
+
         @self._handler.add(MessageEvent, message=TextMessageContent)
         def handler_message(event: MessageEvent) -> https_fn.Response:
             # グループチャットではメンションされた時だけ応答
@@ -117,8 +131,6 @@ class WebhookHandler:
         if not group:
             group = Group(id=group_id)
             self._group_repo.save(group)
-
-        self._sync_member(group_id, event.source.user_id)
 
         conversation = Conversation()
         extra = ""
