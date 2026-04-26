@@ -32,12 +32,6 @@ class PaymentService:
             return {}
         return {m.user_id: m.display_name for m in group.members}
 
-    def _get_members_list(self, group_id: str) -> list[dict]:
-        group = self._group_repo.find_by_id(group_id)
-        if not group:
-            return []
-        return [{"user_id": m.user_id, "display_name": m.display_name} for m in group.members]
-
     def _get_or_create_active_session(self, group_id: str) -> Session:
         session = self._session_repo.fetch_active(group_id)
         if session:
@@ -138,11 +132,10 @@ class PaymentService:
         if not session:
             return {"status": "error", "message": "アクティブなセッションがありません。"}
 
-        members = self._get_members_list(group_id)
-        member_map = {m["user_id"]: m["display_name"] for m in members}
+        member_map = self._get_members_map(group_id)
 
         if div_num is None:
-            div_num = len(members)
+            div_num = len(member_map)
 
         if div_num == 0:
             return {
@@ -150,10 +143,10 @@ class PaymentService:
                 "message": "グループにメンバーが登録されていません。div_num を指定してください。",
             }
 
-        if div_num > len(members):
+        if div_num > len(member_map):
             return {
                 "status": "error",
-                "message": f"精算人数({div_num})がグループメンバー数({len(members)})を超えています。",
+                "message": f"精算人数({div_num})がグループメンバー数({len(member_map)})を超えています。",
             }
 
         raw_payments = self._payment_repo.list_all(group_id, session.session_id)
@@ -181,12 +174,12 @@ class PaymentService:
             for pid, amt in payer_totals.items()
         ]
 
-        if div_num == len(members):
+        if div_num == len(member_map):
             # div_num 未指定（全員割り勘）: 未払いメンバーを全員追加
             paid_ids = set(payer_totals.keys())
-            for m in members:
-                if m["user_id"] not in paid_ids:
-                    paid.append({"name": m["display_name"], "amount": 0})
+            for user_id, display_name in member_map.items():
+                if user_id not in paid_ids:
+                    paid.append({"name": display_name, "amount": 0})
         else:
             # div_num 指定あり: 残り枠を「未払いX」で補完
             for i in range(div_num - len(paid)):
