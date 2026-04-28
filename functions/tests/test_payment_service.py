@@ -297,6 +297,18 @@ class TestSettle:
         assert result["status"] == "error"
         assert "メンバーが登録されていません" in result["message"]
 
+    def test_settle_unknown_payer(self, svc, group_repo, session_repo, payment_repo):
+        """メンバーマップに存在しない payer_id の支払いがある → エラー"""
+        session_repo.fetch_active.return_value = _make_session()
+        group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS)
+        payment_repo.list_all.return_value = [
+            {"payment_id": "p0", "payer_id": "UNKNOWN", "amount": 3000},
+        ]
+
+        result = svc.settle("G1")
+        assert result["status"] == "error"
+        assert "グループメンバーに存在しません" in result["message"]
+
     # ── 境界値 ──
 
     def test_settle_one_member(self, svc, group_repo, session_repo, payment_repo):

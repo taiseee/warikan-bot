@@ -150,6 +150,13 @@ class PaymentService:
             payer_id = p["payer_id"]
             payer_totals[payer_id] = payer_totals.get(payer_id, 0) + p["amount"]
 
+        unknown_payers = set(payer_totals.keys()) - set(member_map.keys())
+        if unknown_payers:
+            return {
+                "status": "error",
+                "message": "支払い者の一部がグループメンバーに存在しません。グループメンバーを確認してください。",
+            }
+
         total_amount = sum(payer_totals.values())
         per_person = total_amount / len(member_map)
 
