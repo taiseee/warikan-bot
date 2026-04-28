@@ -51,12 +51,6 @@ class WebhookHandler:
 
         self._add()
 
-    def _is_mentioned(self, event: MessageEvent) -> bool:
-        mention = getattr(event.message, "mention", None)
-        if not mention:
-            return False
-        return any(getattr(m, "is_self", False) for m in (mention.mentionees or []))
-
     def handle(self, body: str, signature: str) -> https_fn.Response:
         try:
             self._handler.handle(body, signature)
@@ -99,9 +93,6 @@ class WebhookHandler:
 
         @self._handler.add(MessageEvent, message=TextMessageContent)
         def handler_message(event: MessageEvent) -> https_fn.Response:
-            # グループチャットではメンションされた時だけ応答
-            if getattr(event.source, "type", "") == "group" and not self._is_mentioned(event):
-                return
             self._process_group_message(event, event.message.text)
             return https_fn.Response({"message": "success"}, status=200)
 
@@ -325,7 +316,7 @@ class Tool:
             return svc.list_payments(gid)
 
         if name == "settle":
-            return svc.settle(gid, div_num=args.get("div_num"))
+            return svc.settle(gid)
 
         if name == "list_sessions":
             is_settled = args.get("is_settled")

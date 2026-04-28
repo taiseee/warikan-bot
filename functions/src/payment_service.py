@@ -127,26 +127,17 @@ class PaymentService:
             "total_amount": total,
         }
 
-    def settle(self, group_id: str, div_num: int = None) -> dict:
+    def settle(self, group_id: str) -> dict:
         session = self._session_repo.fetch_active(group_id)
         if not session:
             return {"status": "error", "message": "アクティブなセッションがありません。"}
 
         member_map = self._get_members_map(group_id)
 
-        if div_num is None:
-            div_num = len(member_map)
-
-        if div_num == 0:
+        if not member_map:
             return {
                 "status": "error",
-                "message": "グループにメンバーが登録されていません。div_num を指定してください。",
-            }
-
-        if div_num > len(member_map):
-            return {
-                "status": "error",
-                "message": f"精算人数({div_num})がグループメンバー数({len(member_map)})を超えています。",
+                "message": "グループにメンバーが登録されていません。",
             }
 
         raw_payments = self._payment_repo.list_all(group_id, session.session_id)
@@ -159,31 +150,20 @@ class PaymentService:
             payer_id = p["payer_id"]
             payer_totals[payer_id] = payer_totals.get(payer_id, 0) + p["amount"]
 
-        if len(payer_totals) > div_num:
-            return {
-                "status": "error",
-                "message": f"精算人数({div_num})より支払い者数({len(payer_totals)})が多いです。div_num を大きく設定してください。",
-            }
-
         total_amount = sum(payer_totals.values())
-        per_person = total_amount / div_num
+        per_person = total_amount / len(member_map)
 
-        # payment_balance リストを構築（支払い者）
+        # 支払い者リストを構築
         paid = [
             {"name": member_map.get(pid, pid), "amount": amt}
             for pid, amt in payer_totals.items()
         ]
 
-        if div_num == len(member_map):
-            # div_num 未指定（全員割り勘）: 未払いメンバーを全員追加
-            paid_ids = set(payer_totals.keys())
-            for user_id, display_name in member_map.items():
-                if user_id not in paid_ids:
-                    paid.append({"name": display_name, "amount": 0})
-        else:
-            # div_num 指定あり: 残り枠を「未払いX」で補完
-            for i in range(div_num - len(paid)):
-                paid.append({"name": f"未払い{chr(ord('A') + i)}", "amount": 0})
+        # 未払いメンバーをメンバー名で追加
+        paid_ids = set(payer_totals.keys())
+        for user_id, display_name in member_map.items():
+            if user_id not in paid_ids:
+                paid.append({"name": display_name, "amount": 0})
 
         payment_balance = [
             {"name": p["name"], "amount": p["amount"] - per_person}
