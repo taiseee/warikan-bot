@@ -252,23 +252,8 @@ class TestSettle:
         assert len(result["details"]["transfers"]) > 0
         session_repo.save.assert_called_once()
 
-    def test_settle_with_div_num(self, svc, group_repo, session_repo, payment_repo):
-        """div_num=2 < メンバー数3: 支払い者1人 + 未払いA で2人精算"""
-        session_repo.fetch_active.return_value = _make_session()
-        group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS)
-        payment_repo.list_all.return_value = [
-            {"payment_id": "p0", "payer_id": "U1", "amount": 2000},
-        ]
-
-        result = svc.settle("G1", div_num=2)
-        assert result["status"] == "success"
-        assert result["details"]["per_person"] == 1000
-        # 未払いA → U1 への送金が1件
-        assert len(result["details"]["transfers"]) == 1
-        assert result["details"]["transfers"][0]["from_name"] == "未払いA"
-
-    def test_settle_with_unpaid_members_default(self, svc, group_repo, session_repo, payment_repo):
-        """div_num=None → 全メンバーが paid に含まれる（未払いメンバーは display_name で追加）"""
+    def test_settle_all_members_with_names(self, svc, group_repo, session_repo, payment_repo):
+        """未払いメンバーは display_name で transfers に含まれる"""
         session_repo.fetch_active.return_value = _make_session()
         group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS)
         payment_repo.list_all.return_value = [
@@ -282,21 +267,6 @@ class TestSettle:
         transfer_froms = {t["from_name"] for t in result["details"]["transfers"]}
         assert "Bob" in transfer_froms
         assert "Charlie" in transfer_froms
-
-    def test_settle_div_num_fills_anonymous(self, svc, group_repo, session_repo, payment_repo):
-        """div_num=3 < メンバー5人, 支払い者1人 → 未払いA, 未払いB で補完"""
-        session_repo.fetch_active.return_value = _make_session()
-        group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS_5)
-        payment_repo.list_all.return_value = [
-            {"payment_id": "p0", "payer_id": "U1", "amount": 3000},
-        ]
-
-        result = svc.settle("G1", div_num=3)
-        assert result["status"] == "success"
-        assert result["details"]["per_person"] == 1000
-        transfer_froms = [t["from_name"] for t in result["details"]["transfers"]]
-        assert "未払いA" in transfer_froms
-        assert "未払いB" in transfer_froms
 
     # ── 異常系 ──
 
@@ -318,8 +288,8 @@ class TestSettle:
         assert result["status"] == "error"
         assert "支払いが記録されていません" in result["message"]
 
-    def test_settle_div_num_zero(self, svc, group_repo, session_repo):
-        """メンバー0人 & div_num=None → div_num=0 → エラー"""
+    def test_settle_no_members(self, svc, group_repo, session_repo):
+        """メンバー0人 → エラー"""
         session_repo.fetch_active.return_value = _make_session()
         group_repo.find_by_id.return_value = _make_group_with_members([])
 
@@ -327,40 +297,29 @@ class TestSettle:
         assert result["status"] == "error"
         assert "メンバーが登録されていません" in result["message"]
 
-    def test_settle_div_num_exceeds_members(self, svc, group_repo, session_repo):
-        """div_num > メンバー数 → エラー（ユースケース外）"""
-        session_repo.fetch_active.return_value = _make_session()
-        group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS)
-
-        result = svc.settle("G1", div_num=5)
-        assert result["status"] == "error"
-        assert "グループメンバー数" in result["message"]
-
-    def test_settle_div_num_less_than_payers(self, svc, group_repo, session_repo, payment_repo):
-        """div_num < 支払い者数 → エラー"""
+    def test_settle_unknown_payer(self, svc, group_repo, session_repo, payment_repo):
+        """メンバーマップに存在しない payer_id の支払いがある → エラー"""
         session_repo.fetch_active.return_value = _make_session()
         group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS)
         payment_repo.list_all.return_value = [
-            {"payment_id": "p0", "payer_id": "U1", "amount": 1000},
-            {"payment_id": "p1", "payer_id": "U2", "amount": 1000},
-            {"payment_id": "p2", "payer_id": "U3", "amount": 1000},
+            {"payment_id": "p0", "payer_id": "UNKNOWN", "amount": 3000},
         ]
 
-        result = svc.settle("G1", div_num=2)
+        result = svc.settle("G1")
         assert result["status"] == "error"
-        assert "精算人数" in result["message"]
+        assert "グループメンバーに存在しません" in result["message"]
 
     # ── 境界値 ──
 
-    def test_settle_div_num_one(self, svc, group_repo, session_repo, payment_repo):
-        """div_num=1 → 1人で全額負担、送金なし"""
+    def test_settle_one_member(self, svc, group_repo, session_repo, payment_repo):
+        """メンバー1人 → 1人で全額負担、送金なし"""
         session_repo.fetch_active.return_value = _make_session()
         group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS[:1])
         payment_repo.list_all.return_value = [
             {"payment_id": "p0", "payer_id": "U1", "amount": 1000},
         ]
 
-        result = svc.settle("G1", div_num=1)
+        result = svc.settle("G1")
         assert result["status"] == "success"
         assert result["details"]["per_person"] == 1000
         assert result["details"]["transfers"] == []
@@ -378,7 +337,7 @@ class TestSettle:
         assert result["details"]["per_person"] == round(1000 / 3)
 
     def test_settle_tiny_amount(self, svc, group_repo, session_repo, payment_repo):
-        """amount=1, div_num=3 → per_person ≈ 0.33、端数処理"""
+        """amount=1, メンバー3人 → per_person ≈ 0.33、端数処理"""
         session_repo.fetch_active.return_value = _make_session()
         group_repo.find_by_id.return_value = _make_group_with_members(MEMBERS)
         payment_repo.list_all.return_value = [
